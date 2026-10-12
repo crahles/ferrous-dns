@@ -39,8 +39,29 @@ impl DnsResolver for Scripted {
 
 /// The handler, and the COOKIE payload it must return for `CLIENT_COOKIE`.
 fn server(outcome: Result<DnsResolution, DomainError>) -> (DnsServerHandler, Vec<u8>) {
+    server_with_policy(outcome, POLICY)
+}
+
+/// [`server`], answering blocks under `policy`.
+fn server_with_policy(
+    outcome: Result<DnsResolution, DomainError>,
+    policy: BlockPolicy,
+) -> (DnsServerHandler, Vec<u8>) {
+    handler_with(outcome, policy, false)
+}
+
+/// [`server`] in strict cookie mode: `require_valid_cookie = true`.
+fn strict_server(outcome: Result<DnsResolution, DomainError>) -> (DnsServerHandler, Vec<u8>) {
+    handler_with(outcome, POLICY, true)
+}
+
+fn handler_with(
+    outcome: Result<DnsResolution, DomainError>,
+    policy: BlockPolicy,
+    require_valid_cookie: bool,
+) -> (DnsServerHandler, Vec<u8>) {
     let cookies = DnsCookiesConfig {
-        require_valid_cookie: false,
+        require_valid_cookie,
         ..DnsCookiesConfig::default()
     };
     let use_case = HandleDnsQueryUseCase::new(
@@ -53,7 +74,7 @@ fn server(outcome: Result<DnsResolution, DomainError>) -> (DnsServerHandler, Vec
         .cookie_guard()
         .expect("cookies are enabled")
         .generate_server_cookie(CLIENT, &CLIENT_COOKIE);
-    let handler = DnsServerHandler::new(Arc::new(use_case), POLICY);
+    let handler = DnsServerHandler::new(Arc::new(use_case), policy);
     (handler, [&CLIENT_COOKIE[..], &server_cookie].concat())
 }
 
@@ -166,7 +187,7 @@ async fn outcomes_map_to_rcode_extended_error_and_block_answer() {
         (E::NxDomain, NXDomain, None, false),
         (E::LocalNxDomain, NXDomain, None, false),
         (E::DnsRateLimited, Refused, Some(18), false),
-        (E::DnsCookieInvalid, Refused, Some(25), false),
+        (E::DnsCookieInvalid, Refused, Some(18), false),
         (E::QueryTimeout, ServFail, Some(22), false),
         (E::DnssecBogus, ServFail, Some(6), false),
         (E::DnssecIndeterminate, ServFail, Some(5), false),
@@ -225,16 +246,49 @@ async fn a_shed_query_is_dropped_over_udp_and_answered_servfail_on_streams() {
     }
 }
 
+/// RFC 6891 §7 / RFC 7873 §5.3: every reply we build (answers, errors,
+/// blocks under each policy and truncations) carries an OPT exactly when
+/// the query did, and our cookie exactly when the query sent one. A client
+/// that has learned our server cookie drops a reply without it (issue #279).
 #[tokio::test]
-async fn built_answers_carry_opt_exactly_when_the_query_did() {
-    let outcomes = [
-        (Ok(answer(None)), true),
-        (Err(DomainError::NxDomain), false),
-        (Err(DomainError::Blocked), false),
-    ];
-    for (outcome, answered) in outcomes {
-        let label = format!("{outcome:?}");
-        let (handler, our_cookie) = server(outcome);
+async fn built_answers_carry_opt_and_cookie_exactly_when_the_query_did() {
+    use BlockResponseMode::{NoData, NullIp, NxDomain, Refused};
+    use DomainError as E;
+    // Larger than the 1232-byte buffer the query advertises, so TC=1.
+    let oversized = DnsResolution::new(
+        (0..100)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)))
+            .collect(),
+        false,
+    );
+    let mut cases: Vec<_> = [
+        Ok(answer(None)),
+        Ok(oversized),
+        Err(E::NxDomain),
+        Err(E::LocalNxDomain),
+        Err(E::DnsRateLimited),
+        Err(E::DnsRateLimitedSlip),
+        Err(E::DnsCookieInvalid),
+        Err(E::QueryTimeout),
+        Err(E::DnssecBogus),
+        Err(E::Blocked),
+        Err(E::DgaDomainDetected),
+        Err(E::FilteredQuery("p".into())),
+        Err(E::DnsTunnelingDetected),
+    ]
+    .into_iter()
+    .map(|outcome| (NullIp, outcome))
+    .collect();
+    cases.extend([NxDomain, NoData, Refused].map(|mode| (mode, Err(E::Blocked))));
+
+    // Every shape is checked before failing, so a failure lists them all.
+    let mut dropped = Vec::new();
+    for (mode, outcome) in cases {
+        let label = match &outcome {
+            Ok(resolution) => format!("{mode:?}, {} addresses", resolution.addresses.len()),
+            Err(err) => format!("{mode:?}, {err:?}"),
+        };
+        let (handler, our_cookie) = server_with_policy(outcome, BlockPolicy { mode, ..POLICY });
 
         let plain = ask(&handler, &query(RecordType::A, None, false, false)).await;
         assert!(
@@ -243,12 +297,78 @@ async fn built_answers_carry_opt_exactly_when_the_query_did() {
         );
 
         let reply = ask(&handler, &query(RecordType::A, Some(true), true, false)).await;
-        let opt = reply.edns.as_ref().expect("OPT echoed");
-        assert!(opt.flags().dnssec_ok, "{label}: DO copied (RFC 3225 §3)");
-        assert_eq!(opt.max_payload(), 4096, "{label}");
-        if answered {
-            assert_eq!(option(&reply, 10), Some(our_cookie), "RFC 7873 §5.2");
+        match reply.edns.as_ref() {
+            None => dropped.push(format!("{label}: no OPT")),
+            Some(opt) => {
+                assert!(opt.flags().dnssec_ok, "{label}: DO copied (RFC 3225 §3)");
+                assert_eq!(opt.max_payload(), 4096, "{label}");
+                if option(&reply, 10) != Some(our_cookie) {
+                    dropped.push(format!("{label}: no cookie"));
+                }
+            }
         }
+
+        let cookieless = ask(&handler, &query(RecordType::A, Some(false), false, false)).await;
+        if cookieless.edns.is_none() {
+            dropped.push(format!("{label}: no OPT without a cookie"));
+        }
+        assert_eq!(option(&cookieless, 10), None, "{label}: no cookie sent");
+    }
+    assert!(dropped.is_empty(), "{dropped:#?}");
+}
+
+/// RFC 7873 §5.2.3/§5.2.4: over UDP, strict mode answers a client cookie
+/// without a valid server cookie with BADCOOKIE and ours, which the client
+/// retries with, and a query with no cookie with REFUSED. TCP, TLS and QUIC
+/// prove the source address, so they need no cookie: DoH clients send none.
+#[tokio::test]
+async fn strict_mode_hands_out_our_cookie_with_badcookie_over_udp() {
+    let (handler, our_cookie) = strict_server(Ok(answer(None)));
+    let stale = [&CLIENT_COOKIE[..], &[0xEE; 8]].concat();
+    let ede = |reply: &Message| option(reply, 15).map(|d| u16::from_be_bytes([d[0], d[1]]));
+
+    for sent in [&CLIENT_COOKIE[..], &stale] {
+        let q = query_with_cookie(RecordType::A, Some(false), Some(sent), false);
+        let reply = ask(&handler, &q).await;
+        assert_eq!(u16::from(reply.metadata.response_code), 23, "BADCOOKIE");
+        assert!(reply.answers.is_empty());
+        assert_eq!(option(&reply, 10), Some(our_cookie.clone()));
+        assert_eq!(ede(&reply), Some(18), "Prohibited (RFC 8914 §4.19)");
+    }
+
+    let q = query_with_cookie(RecordType::A, Some(false), Some(&our_cookie), false);
+    let retry = ask(&handler, &q).await;
+    assert_eq!(retry.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(retry.answers.len(), 1);
+    assert_eq!(option(&retry, 10), Some(our_cookie));
+
+    for edns in [None, Some(false)] {
+        let reply = ask(&handler, &query(RecordType::A, edns, false, false)).await;
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::Refused,
+            "{edns:?}"
+        );
+        assert_eq!(option(&reply, 10), None, "{edns:?}");
+    }
+
+    let q = query(RecordType::A, Some(false), false, false);
+    for protocol in [
+        ClientProtocol::Tcp,
+        ClientProtocol::Dot,
+        ClientProtocol::Doh,
+        ClientProtocol::Doq,
+    ] {
+        let reply = handler
+            .handle_raw_udp_fallback(&q, CLIENT, protocol)
+            .await
+            .expect("answered");
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "{protocol}"
+        );
     }
 }
 
