@@ -6,10 +6,11 @@
 
 use ferrous_dns_application::ports::DnsResolver;
 use ferrous_dns_domain::{DnsQuery, DomainError, RecordType, UpstreamPool, UpstreamStrategy};
+use ferrous_dns_infrastructure::dns::cache::coarse_clock;
 use ferrous_dns_infrastructure::dns::resolver::{CachedResolver, CoreResolver};
 use ferrous_dns_infrastructure::dns::{
-    CachedAddresses, CachedData, DnsCache, DnsCacheAccess, DnsCacheConfig, DnsCacheMaintenance,
-    EvictionStrategy, PoolManager, RefreshRequest,
+    CachedAddresses, CachedData, ColdThresholds, DnsCache, DnsCacheAccess, DnsCacheConfig,
+    DnsCacheMaintenance, EvictionStrategy, PoolManager, RefreshRequest, RefreshSenders, TimerInbox,
 };
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, SOA};
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 const DOMAIN: &str = "example.com";
 const OLD_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -286,9 +287,10 @@ async fn servfailing_pool_falls_through_to_the_next_pool() {
     );
 }
 
-/// S7.
+/// S7. Every pool declining with SERVFAIL is told apart from an unreachable
+/// upstream, so a refresh can retry it.
 #[tokio::test]
-async fn every_pool_servfailing_is_unreachable() {
+async fn every_pool_servfailing_is_distinguishable() {
     let first = Responder::spawn(Behavior::rcode(ResponseCode::ServFail)).await;
     let second = Responder::spawn(Behavior::rcode(ResponseCode::ServFail)).await;
     let pm = manager(vec![
@@ -299,10 +301,108 @@ async fn every_pool_servfailing_is_unreachable() {
 
     let result = query_a(&pm).await;
     assert!(
-        matches!(result, Err(DomainError::TransportAllServersUnreachable)),
+        matches!(result, Err(DomainError::AllUpstreamsServfail)),
         "got {result:?}"
     );
     assert_eq!(second.queries(), 1, "the fallback pool must be tried");
+}
+
+/// S7b. Guard: a SERVFAIL next to a timeout is not "every upstream answered
+/// SERVFAIL", so it stays an unreachable upstream.
+#[tokio::test]
+async fn servfail_and_timeout_across_pools_stays_unreachable() {
+    let failing = Responder::spawn(Behavior::rcode(ResponseCode::ServFail)).await;
+    let silent =
+        Responder::spawn(Behavior::answer(NEW_IP).after(Duration::from_millis(TIMEOUT_MS + 1_000)))
+            .await;
+    let pm = manager(vec![
+        pool("primary", UpstreamStrategy::Failover, 1, &[&failing]),
+        pool("fallback", UpstreamStrategy::Failover, 2, &[&silent]),
+    ])
+    .await;
+
+    let result = query_a(&pm).await;
+    assert!(
+        matches!(result, Err(DomainError::TransportAllServersUnreachable)),
+        "got {result:?}"
+    );
+}
+
+/// S7c. Inside one pool, every strategy reports SERVFAIL from all of its
+/// servers as such, and anything else mixed in as an unreachable upstream.
+#[tokio::test]
+async fn every_strategy_reports_servfail_only_when_every_server_answered_it() {
+    let cases: [(UpstreamStrategy, &[ResponseCode], bool); 8] = [
+        (
+            UpstreamStrategy::Failover,
+            &[ResponseCode::ServFail, ResponseCode::ServFail],
+            true,
+        ),
+        (
+            UpstreamStrategy::Failover,
+            &[ResponseCode::ServFail, ResponseCode::Refused],
+            false,
+        ),
+        (
+            UpstreamStrategy::Balanced,
+            &[ResponseCode::ServFail, ResponseCode::ServFail],
+            true,
+        ),
+        (
+            UpstreamStrategy::Balanced,
+            &[ResponseCode::Refused, ResponseCode::ServFail],
+            false,
+        ),
+        (
+            UpstreamStrategy::Parallel,
+            &[ResponseCode::ServFail, ResponseCode::ServFail],
+            true,
+        ),
+        (
+            UpstreamStrategy::Parallel,
+            &[ResponseCode::ServFail, ResponseCode::Refused],
+            false,
+        ),
+        (
+            UpstreamStrategy::Parallel,
+            &[
+                ResponseCode::ServFail,
+                ResponseCode::ServFail,
+                ResponseCode::ServFail,
+            ],
+            true,
+        ),
+        (
+            UpstreamStrategy::Parallel,
+            &[
+                ResponseCode::ServFail,
+                ResponseCode::Refused,
+                ResponseCode::ServFail,
+            ],
+            false,
+        ),
+    ];
+    for (strategy, rcodes, servfail) in cases {
+        let mut servers = Vec::new();
+        for rcode in rcodes {
+            servers.push(Responder::spawn(Behavior::rcode(*rcode)).await);
+        }
+        let refs: Vec<&Responder> = servers.iter().collect();
+        let pm = manager(vec![pool("only", strategy, 1, &refs)]).await;
+
+        let result = query_a(&pm).await;
+        if servfail {
+            assert!(
+                matches!(result, Err(DomainError::AllUpstreamsServfail)),
+                "{strategy:?} {rcodes:?}: got {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(DomainError::TransportAllServersUnreachable)),
+                "{strategy:?} {rcodes:?}: got {result:?}"
+            );
+        }
+    }
 }
 
 /// S8. Guard: NXDOMAIN is the server's answer, so there is nothing to fail
@@ -343,7 +443,6 @@ fn create_cache() -> Arc<DnsCache> {
         access_window_secs: u64::MAX,
         eviction_sample_size: 8,
         lfuk_k_value: 0.5,
-        refresh_sample_rate: 1.0,
         min_ttl: 0,
         max_ttl: 86_400,
     }))
@@ -379,28 +478,30 @@ fn cached_addresses(cache: &Arc<DnsCache>) -> Option<Vec<IpAddr>> {
 
 struct Worker {
     stale: mpsc::Sender<RefreshRequest>,
-    optimistic: mpsc::Sender<RefreshRequest>,
-    _pace: watch::Sender<Option<Duration>>,
 }
 
+/// Wires `cache` to a new worker over `pm`, as the cli wiring does, so the
+/// entries stored after this arm their own refresh timers.
 fn start_worker(cache: &Arc<DnsCache>, pm: Arc<PoolManager>) -> Worker {
+    let _ticker = coarse_clock::start_clock_ticker();
     let (stale, stale_rx) = mpsc::channel(16);
-    let (optimistic, optimistic_rx) = mpsc::channel(16);
-    let (pace, pace_rx) = watch::channel(None);
+    let timers = Arc::new(TimerInbox::new(16));
+    cache.set_refresh_senders(RefreshSenders {
+        stale: stale.clone(),
+        timers: Some(Arc::clone(&timers)),
+    });
     DnsCacheMaintenance::start_refresh_worker(
         Arc::clone(cache),
         Arc::new(CoreResolver::new(pm, TIMEOUT_MS, false)),
         None,
         stale_rx,
-        optimistic_rx,
-        pace_rx,
-        0,
+        Some(timers),
+        ColdThresholds {
+            min_hit_rate: 0.0,
+            min_frequency: 0,
+        },
     );
-    Worker {
-        stale,
-        optimistic,
-        _pace: pace,
-    }
+    Worker { stale }
 }
 
 fn request() -> RefreshRequest {
@@ -471,16 +572,16 @@ async fn stale_repair_keeps_the_cached_answer_when_upstream_servfails() {
     );
 }
 
-/// S11. Same for a background prefetch.
+/// S11. Same for a renewal ahead of expiry: the entry, stored with the
+/// worker running, falls due a second in.
 #[tokio::test]
 async fn optimistic_refresh_keeps_the_cached_answer_when_upstream_servfails() {
     let up = Responder::spawn(Behavior::rcode(ResponseCode::ServFail)).await;
     let pm = manager(vec![pool("only", UpstreamStrategy::Failover, 1, &[&up])]).await;
     let cache = create_cache();
+    let _worker = start_worker(&cache, pm);
     insert_ip(&cache, OLD_IP);
-    let worker = start_worker(&cache, pm);
 
-    worker.optimistic.send(request()).await.unwrap();
     wait_for_queries(&up, 1).await;
 
     assert_eq!(

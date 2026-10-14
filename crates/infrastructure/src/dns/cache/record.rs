@@ -1,23 +1,28 @@
 use super::coarse_clock::coarse_now_secs;
 use super::data::{CachedData, CachedDnssecStatus};
+use super::schedule::refresh_due_at;
 use ferrous_dns_domain::RecordType;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 
 const FLAG_DELETED: u8 = 0b001;
 const FLAG_REFRESHING: u8 = 0b010;
 const FLAG_PERMANENT: u8 = 0b100;
-/// Set when a maintenance cycle has handed the entry to the optimistic queue
-/// but no resolution has started yet.
-///
-/// Deliberately distinct from `FLAG_REFRESHING`: an entry can sit queued for a
-/// large part of a cycle, and during that window a client hitting the stale
-/// path must still be able to schedule the fast, unpaced repair. Only
-/// `FLAG_REFRESHING` — a resolution actually in flight — blocks that.
-const FLAG_REFRESH_QUEUED: u8 = 0b1000;
 /// Set when the answer came from the configured local DNS server, so a hit
 /// stays exempt from checks that trust local answers (rebinding, NXDOMAIN budget).
 const FLAG_LOCAL_DNS: u8 = 0b1_0000;
 const STALE_GRACE_PERIOD_MULTIPLIER: u64 = 2;
+
+/// [`HotCounters::refresh_timer`] when no timer is pending and compaction
+/// arms the next one: a renewal failed or was declined for good, the timer
+/// was shed, or refreshes are off. Hits leave it alone, so a failing upstream
+/// is retried once per compaction pass, not once per hit.
+const TIMER_LAPSED: u64 = 0;
+/// [`HotCounters::refresh_timer`] when the entry's timer fired while nobody
+/// was using it. Its next hit arms a new one.
+const TIMER_PARKED: u64 = u64::MAX - 1;
+/// [`HotCounters::refresh_timer`] when the worker took the timer and the
+/// renewal waits for a permit.
+const TIMER_CLAIMED: u64 = u64::MAX;
 
 #[repr(align(64))]
 pub struct HotCounters {
@@ -31,6 +36,11 @@ pub struct HotCounters {
     /// value at the last renewal is what makes "hits per minute since the last
     /// renewal" measurable.
     pub hits_at_last_refresh: AtomicU64,
+    /// The second the entry's pending refresh timer falls due, or one of the
+    /// `TIMER_*` states when none is pending. It is the only timer of the
+    /// entry that counts: one that fires for any other second is stale and
+    /// spends nothing. Sits in this struct's padding, so it costs no space.
+    refresh_timer: AtomicU64,
 }
 
 impl HotCounters {
@@ -39,6 +49,7 @@ impl HotCounters {
             hit_count: AtomicU64::new(0),
             last_access: AtomicU64::new(now_secs),
             hits_at_last_refresh: AtomicU64::new(0),
+            refresh_timer: AtomicU64::new(TIMER_LAPSED),
         }
     }
 }
@@ -54,6 +65,10 @@ impl std::fmt::Debug for HotCounters {
             .field(
                 "hits_at_last_refresh",
                 &self.hits_at_last_refresh.load(AtomicOrdering::Relaxed),
+            )
+            .field(
+                "refresh_timer",
+                &self.refresh_timer.load(AtomicOrdering::Relaxed),
             )
             .finish()
     }
@@ -87,6 +102,9 @@ impl Clone for CachedRecord {
                     self.counters
                         .hits_at_last_refresh
                         .load(AtomicOrdering::Relaxed),
+                ),
+                refresh_timer: AtomicU64::new(
+                    self.counters.refresh_timer.load(AtomicOrdering::Relaxed),
                 ),
             },
             ttl: self.ttl,
@@ -230,17 +248,105 @@ impl CachedRecord {
             .fetch_and(!FLAG_REFRESHING, AtomicOrdering::Release);
     }
 
-    /// Claims the entry for the optimistic queue, de-duplicating it across
-    /// cycles: a candidate still waiting to be drained is not offered again.
     #[inline(always)]
-    pub fn try_set_refresh_queued(&self) -> bool {
-        self.try_set_flag(FLAG_REFRESH_QUEUED)
+    pub(crate) fn is_refreshing(&self) -> bool {
+        self.flags.load(AtomicOrdering::Relaxed) & FLAG_REFRESHING != 0
+    }
+
+    /// The second this entry falls due for renewal; see [`refresh_due_at`].
+    #[inline(always)]
+    pub(crate) fn refresh_due_at_secs(&self, threshold: f64) -> u64 {
+        refresh_due_at(self.inserted_at_secs, self.ttl, threshold)
+    }
+
+    /// Sets the pending timer of a record the caller holds exclusively: not
+    /// yet shared, or under the map's write guard.
+    #[inline]
+    pub(crate) fn set_refresh_timer(&mut self, due_at_secs: u64) {
+        *self.counters.refresh_timer.get_mut() = due_at_secs;
+    }
+
+    /// Leaves the record with no timer, under the map's write guard.
+    #[inline]
+    pub(crate) fn lapse_refresh_timer(&mut self) {
+        *self.counters.refresh_timer.get_mut() = TIMER_LAPSED;
+    }
+
+    /// Parks a lapsed record nobody uses, under the map's write guard.
+    #[inline]
+    pub(crate) fn park_lapsed_refresh(&mut self) {
+        *self.counters.refresh_timer.get_mut() = TIMER_PARKED;
+    }
+
+    /// Whether a hit should arm a new timer. One load on the line the hit
+    /// has just written, since every L2 hit asks.
+    #[inline(always)]
+    pub(crate) fn is_refresh_parked(&self) -> bool {
+        self.counters.refresh_timer.load(AtomicOrdering::Relaxed) == TIMER_PARKED
     }
 
     #[inline(always)]
-    pub fn clear_refresh_queued(&self) {
-        self.flags
-            .fetch_and(!FLAG_REFRESH_QUEUED, AtomicOrdering::Release);
+    pub(crate) fn is_refresh_lapsed(&self) -> bool {
+        self.counters.refresh_timer.load(AtomicOrdering::Relaxed) == TIMER_LAPSED
+    }
+
+    #[inline]
+    fn swap_refresh_timer(&self, from: u64, to: u64) -> bool {
+        self.counters
+            .refresh_timer
+            .compare_exchange(from, to, AtomicOrdering::AcqRel, AtomicOrdering::Relaxed)
+            .is_ok()
+    }
+
+    /// Takes the timer due at `due_at_secs` for the worker; `false` if it is
+    /// not the entry's pending timer, or another taker won.
+    #[inline]
+    pub(crate) fn try_claim_refresh_timer(&self, due_at_secs: u64) -> bool {
+        self.swap_refresh_timer(due_at_secs, TIMER_CLAIMED)
+    }
+
+    /// Spends a claimed timer on a renewal about to start; `false` if a
+    /// renewal since replaced it with the next one.
+    #[inline]
+    pub(crate) fn try_start_claimed_refresh(&self) -> bool {
+        self.swap_refresh_timer(TIMER_CLAIMED, TIMER_LAPSED)
+    }
+
+    /// Gives a claimed timer up without a renewal: the entry is dead.
+    #[inline]
+    pub(crate) fn lapse_claimed_refresh(&self) {
+        self.swap_refresh_timer(TIMER_CLAIMED, TIMER_LAPSED);
+    }
+
+    /// Parks a claimed timer: nobody is using the entry.
+    #[inline]
+    pub(crate) fn park_claimed_refresh(&self) {
+        self.swap_refresh_timer(TIMER_CLAIMED, TIMER_PARKED);
+    }
+
+    /// Takes a parked timer back for the worker.
+    #[inline]
+    pub(crate) fn try_reclaim_parked_refresh(&self) -> bool {
+        self.swap_refresh_timer(TIMER_PARKED, TIMER_CLAIMED)
+    }
+
+    /// Arms a timer on a parked entry; `false` if another hit won.
+    #[inline]
+    pub(crate) fn try_unpark_refresh(&self, due_at_secs: u64) -> bool {
+        self.swap_refresh_timer(TIMER_PARKED, due_at_secs)
+    }
+
+    /// Arms a timer on a lapsed entry; `false` if it is not lapsed.
+    #[inline]
+    pub(crate) fn try_rearm_lapsed_refresh(&self, due_at_secs: u64) -> bool {
+        self.swap_refresh_timer(TIMER_LAPSED, due_at_secs)
+    }
+
+    /// Drops the timer due at `due_at_secs` the worker never received, so
+    /// compaction arms it again.
+    #[inline]
+    pub(crate) fn release_refresh_timer(&self, due_at_secs: u64) {
+        self.swap_refresh_timer(due_at_secs, TIMER_LAPSED);
     }
 
     /// Hits per minute accumulated since the last renewal.
@@ -269,32 +375,18 @@ impl CachedRecord {
             .store(hits, AtomicOrdering::Relaxed);
     }
 
-    /// Whether the entry should be handed to the background refresh queue.
-    ///
-    /// `threshold` is the configured fraction of TTL that must have elapsed.
-    /// That alone is not enough: a candidate waits up to one cycle to be
-    /// scanned and up to one more to be drained, so a purely proportional test
-    /// misses any entry whose remaining life is shorter than that. Hence the
-    /// lead-time floor — whichever fires first wins. The floor is skipped for
-    /// entries whose whole TTL fits inside it, since those cannot be renewed
-    /// ahead of expiry at all and would otherwise never leave the queue.
-    #[inline(always)]
-    pub fn should_refresh(&self, threshold: f64, now_secs: u64, min_lead_secs: u64) -> bool {
-        if (self.ttl as u64) > min_lead_secs
-            && self.expires_at_secs.saturating_sub(now_secs) <= min_lead_secs
-        {
-            return true;
-        }
-
-        let elapsed = now_secs.saturating_sub(self.inserted_at_secs) as f64;
-        elapsed >= (self.ttl as f64) * threshold
-    }
-
     #[inline(always)]
     pub fn record_hit(&self) {
+        self.record_hits(1);
+    }
+
+    /// Counts `count` hits at once: the batch an L1 copy hands over, or one
+    /// L2 hit.
+    #[inline(always)]
+    pub(crate) fn record_hits(&self, count: u64) {
         self.counters
             .hit_count
-            .fetch_add(1, AtomicOrdering::Relaxed);
+            .fetch_add(count, AtomicOrdering::Relaxed);
         let now = super::coarse_clock::coarse_now_secs();
         if self.counters.last_access.load(AtomicOrdering::Relaxed) < now {
             self.counters

@@ -5,6 +5,7 @@ use super::key::{normalize_domain, BorrowedKey, CacheKey};
 use super::l1::{l1_clear, l1_get, l1_insert};
 use super::negative_cache::NegativeDnsCache;
 use super::port::{DnsCacheAccess, LocalRecordStatus};
+use super::schedule::{ScheduledRefresh, TimerInbox};
 use super::{CacheMetrics, CachedData, CachedDnssecStatus, CachedRecord};
 use compact_str::CompactString;
 use dashmap::mapref::one::RefMut;
@@ -49,22 +50,21 @@ const BLOOM_TARGET_FP_RATE: f64 = 0.01;
 /// The TTL a stale hit reports (RFC 8767 §4).
 pub(crate) const STALE_SERVE_TTL: u32 = 2;
 
-/// Message carried by a refresh queue.
+/// Message carried by the serve-stale repair queue.
 pub type RefreshRequest = (Arc<str>, RecordType);
 
-/// The two background-refresh queues, wired up by cache maintenance.
+/// What the cache hands the refresh worker, wired up by cache maintenance.
 ///
-/// They are deliberately separate channels rather than one queue with a tag:
-/// the optimistic stream is rate-paced, and a paced stream sharing a FIFO with
-/// an unpaced one drags the unpaced one down to its rate. A serve-stale repair
-/// queued behind a cycle's worth of prefetches would wait for the whole backlog
-/// to drain, which is exactly the latency serving stale is meant to avoid.
+/// Separate because they are served differently: a serve-stale repair has a
+/// client waiting on it and always goes first, while a timer only says when
+/// an entry falls due.
 pub struct RefreshSenders {
     /// Serve-stale repairs: a client already holds a stale answer and is
-    /// waiting on the real one. Never paced.
+    /// waiting on the real one.
     pub stale: mpsc::Sender<RefreshRequest>,
-    /// Best-effort pre-expiry prefetches produced by a maintenance cycle.
-    pub optimistic: mpsc::Sender<RefreshRequest>,
+    /// Refresh timers, armed as entries are stored and renewed. `None` when
+    /// `cache_optimistic_refresh` is off: nothing is renewed ahead of expiry.
+    pub timers: Option<Arc<TimerInbox>>,
 }
 
 pub struct DnsCacheConfig {
@@ -78,7 +78,6 @@ pub struct DnsCacheConfig {
     pub access_window_secs: u64,
     pub eviction_sample_size: usize,
     pub lfuk_k_value: f64,
-    pub refresh_sample_rate: f64,
     pub min_ttl: u32,
     pub max_ttl: u32,
 }
@@ -93,7 +92,6 @@ pub struct DnsCache {
     pub(super) bloom: AtomicBloom,
     pub(super) access_window_secs: u64,
     pub(super) eviction_sample_size: usize,
-    pub(super) refresh_sample_period: u64,
     pub(super) negative: NegativeDnsCache,
     permanent_records: DashMap<CompactString, PermanentTypes, FxBuildHasher>,
     min_ttl: u32,
@@ -134,10 +132,6 @@ impl DnsCache {
             bloom,
             access_window_secs: config.access_window_secs,
             eviction_sample_size: config.eviction_sample_size.max(1),
-            refresh_sample_period: {
-                let r = config.refresh_sample_rate.clamp(0.001, 1.0);
-                (1.0 / r).ceil() as u64
-            },
             negative: NegativeDnsCache::new(config.max_entries),
             permanent_records: DashMap::with_hasher(FxBuildHasher),
             min_ttl: config.min_ttl,
@@ -147,7 +141,7 @@ impl DnsCache {
     }
 
     #[inline(always)]
-    fn clamp_ttl(&self, ttl: u32) -> u32 {
+    pub(crate) fn clamp_ttl(&self, ttl: u32) -> u32 {
         ttl.clamp(self.min_ttl, self.max_ttl)
     }
 
@@ -179,10 +173,13 @@ impl DnsCache {
         // so reads never decide membership. L1 mirrors L2's address answers,
         // so only an A or AAAA probe is worth its lookup.
         if matches!(record_type, RecordType::A | RecordType::AAAA) {
-            if let Some((arc_data, dnssec_status, local_dns, remaining_ttl)) =
+            if let Some((arc_data, dnssec_status, local_dns, remaining_ttl, l1_hits)) =
                 l1_get(domain, record_type)
             {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                if l1_hits > 0 {
+                    self.record_l1_hits(domain, *record_type, l1_hits);
+                }
                 return Some((
                     CachedData::IpAddresses(super::data::CachedAddresses {
                         addresses: arc_data,
@@ -254,6 +251,9 @@ impl DnsCache {
             } else {
                 self.metrics.hits.fetch_add(1, AtomicOrdering::Relaxed);
                 record.record_hit();
+                if record.is_refresh_parked() {
+                    self.rearm_refresh(&key, record);
+                }
                 let remaining_ttl = record.remaining_ttl_at_secs(now_secs);
                 self.promote_to_l1(domain, record_type, record, now_secs);
                 return Some((
@@ -325,12 +325,23 @@ impl DnsCache {
         let maybe_l1_addresses = data.as_ip_addresses().cloned();
 
         let record = CachedRecord::new(data, ttl, record_type, dnssec_status);
-        let record = if local_dns {
+        let mut record = if local_dns {
             record.with_local_dns()
         } else {
             record
         };
         let expires_secs = record.expires_at_secs;
+        // Armed before it is visible, so nothing else can arm it as well.
+        let timer = self.arming_inbox(ttl).map(|inbox| {
+            let due_at_secs = record.refresh_due_at_secs(self.refresh_threshold);
+            record.set_refresh_timer(due_at_secs);
+            let timer = ScheduledRefresh {
+                due_at_secs,
+                key: key.clone(),
+                retry: false,
+            };
+            (inbox, timer)
+        });
 
         self.bloom.set(&key);
         match self.cache.entry(key) {
@@ -348,7 +359,13 @@ impl DnsCache {
             }
         }
 
+        if let Some((inbox, timer)) = timer {
+            self.push_or_release(inbox, timer);
+        }
+
         if let Some(addresses) = maybe_l1_addresses {
+            // The hits the replaced copy batched belonged to the replaced
+            // record, whose counters this one does not carry over.
             l1_insert(
                 domain,
                 &record_type,
@@ -560,57 +577,104 @@ impl DnsCache {
         }
     }
 
-    /// Sender for the paced queue, once maintenance has wired one up. The
-    /// maintenance cycle enqueues its candidates here rather than keeping a
-    /// second copy of the sender.
-    pub(crate) fn optimistic_refresh_sender(&self) -> Option<&mpsc::Sender<RefreshRequest>> {
-        self.refresh_senders.get().map(|s| &s.optimistic)
+    /// Where refresh timers go, while optimistic refresh is on and its worker
+    /// is wired up.
+    #[inline]
+    pub(super) fn timer_inbox(&self) -> Option<&Arc<TimerInbox>> {
+        self.refresh_senders
+            .get()
+            .and_then(|senders| senders.timers.as_ref())
     }
 
-    /// Counts candidates a cycle had to cut for lack of queue room.
-    pub(crate) fn note_refresh_shed(&self, count: u64) {
-        self.metrics
-            .optimistic_refresh_shed
-            .fetch_add(count, AtomicOrdering::Relaxed);
+    /// [`Self::timer_inbox`] for an entry of `ttl`: one that expires at once
+    /// is never renewed ahead of expiry.
+    #[inline]
+    fn arming_inbox(&self, ttl: u32) -> Option<&Arc<TimerInbox>> {
+        if ttl == 0 {
+            return None;
+        }
+        self.timer_inbox()
     }
 
-    /// Converts a queue claim into an in-flight claim, or declines the item.
-    ///
-    /// Called when the worker pulls an optimistic candidate. The entry may have
-    /// sat in the queue for most of a cycle, during which a serve-stale repair
-    /// may already have renewed it or taken it over — so this re-checks the
-    /// entry instead of spending an upstream query on faith. Returning `false`
-    /// means the caller must not resolve and must not clear any flag: either
-    /// nothing is held, or the holder is someone else.
-    pub(crate) fn claim_queued_for_refresh(
+    /// Hands `timer` to the worker. A full inbox gives it back, counted as
+    /// shed; the caller then lapses the entry, so compaction arms it again.
+    #[inline]
+    fn push_refresh_timer(
         &self,
-        domain: &str,
-        record_type: &RecordType,
-        min_lead_secs: u64,
-    ) -> bool {
-        let key = CacheKey::new(domain, *record_type);
-        let Some(entry) = self.cache.get(&key) else {
-            return false;
-        };
-        let record = entry.value();
+        inbox: &TimerInbox,
+        timer: ScheduledRefresh,
+    ) -> Result<(), ScheduledRefresh> {
+        inbox.push(timer).inspect_err(|_| {
+            self.metrics
+                .optimistic_refresh_shed
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        })
+    }
 
-        // The queue claim is spent either way: this item has left the queue.
-        record.clear_refresh_queued();
-
-        if record.is_permanent() || record.is_marked_for_deletion() {
-            return false;
-        }
-
-        let now = coarse_now_secs();
-        if record.is_expired_at_secs(now) {
-            if !record.is_stale_usable_at_secs(now) {
-                return false;
+    /// [`Self::push_refresh_timer`] for a caller holding no guard on the
+    /// entry, which is looked up again to lapse it if the inbox is full.
+    pub(super) fn push_or_release(&self, inbox: &TimerInbox, timer: ScheduledRefresh) {
+        if let Err(timer) = self.push_refresh_timer(inbox, timer) {
+            if let Some(entry) = self.cache.get(&timer.key) {
+                entry.release_refresh_timer(timer.due_at_secs);
             }
-        } else if !record.should_refresh(self.refresh_threshold, now, min_lead_secs) {
-            return false;
         }
+    }
 
-        record.try_set_refreshing()
+    /// Arms a parked entry that is in use again, for the second it falls due
+    /// (often already past, so it fires on the next tick). The caller holds
+    /// the entry, which is why it is passed in rather than looked up.
+    #[cold]
+    fn rearm_refresh(&self, key: &CacheKey, record: &CachedRecord) {
+        let Some(inbox) = self.arming_inbox(record.ttl) else {
+            return;
+        };
+        let due_at_secs = record.refresh_due_at_secs(self.refresh_threshold);
+        if !record.try_unpark_refresh(due_at_secs) {
+            return;
+        }
+        let timer = ScheduledRefresh {
+            due_at_secs,
+            key: key.clone(),
+            retry: false,
+        };
+        if self.push_refresh_timer(inbox, timer).is_err() {
+            record.release_refresh_timer(due_at_secs);
+        }
+    }
+
+    /// Arms the one more attempt a renewal on a timer gets when it did not
+    /// renew the entry, `in_secs` from now. Called while that renewal still
+    /// holds the entry, so compaction cannot arm it first; a renewal or a
+    /// re-arm that won the entry in the meantime keeps its own timer.
+    pub(crate) fn schedule_retry(&self, domain: &str, record_type: RecordType, in_secs: u64) {
+        let Some(inbox) = self.timer_inbox() else {
+            return;
+        };
+        let key = CacheKey::new(domain, record_type);
+        let due_at_secs = coarse_now_secs() + in_secs;
+        let armed = self
+            .cache
+            .get(&key)
+            .is_some_and(|entry| entry.try_rearm_lapsed_refresh(due_at_secs));
+        if armed {
+            let timer = ScheduledRefresh {
+                due_at_secs,
+                key,
+                retry: true,
+            };
+            self.push_or_release(inbox, timer);
+        }
+    }
+
+    /// Whether `key` is cached. For the worker's sweep of timers whose entry
+    /// is gone.
+    pub(crate) fn holds(&self, key: &CacheKey) -> bool {
+        self.cache.contains_key(key)
+    }
+
+    pub(crate) fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     pub fn refresh_record(
@@ -632,7 +696,7 @@ impl DnsCache {
             return false;
         };
         let now = coarse_now_secs();
-        if let Some(mut entry) = self.cache.get_mut(&key) {
+        let timer = if let Some(mut entry) = self.cache.get_mut(&key) {
             let record = entry.value_mut();
             if record.is_permanent() || record.is_marked_for_deletion() {
                 return false;
@@ -648,13 +712,12 @@ impl DnsCache {
             // move together with `inserted_at_secs` above.
             record.note_refreshed();
             record.clear_refreshing();
-            record.clear_refresh_queued();
 
             let maybe_l1_addresses = new_data.as_ip_addresses().cloned();
             record.data = new_data;
 
             if let Some(addresses) = maybe_l1_addresses {
-                l1_insert(
+                let batched = l1_insert(
                     domain,
                     record_type,
                     addresses,
@@ -662,14 +725,55 @@ impl DnsCache {
                     record.is_local_dns(),
                     record.expires_at_secs,
                 );
+                if batched > 0 {
+                    record.record_hits(u64::from(batched));
+                }
             }
 
             // A renewed TTL is worthless if the bloom gate no longer admits the
             // key, so re-arm it here too instead of waiting for the next rotation.
             self.bloom.set(&key);
-            true
+
+            // The new lifetime gets its own timer, which replaces whatever the
+            // entry had pending: that one now fires stale.
+            match self.arming_inbox(ttl) {
+                Some(inbox) => {
+                    let due_at_secs = record.refresh_due_at_secs(self.refresh_threshold);
+                    record.set_refresh_timer(due_at_secs);
+                    let timer = ScheduledRefresh {
+                        due_at_secs,
+                        key: key.clone(),
+                        retry: false,
+                    };
+                    Some((inbox, timer))
+                }
+                None => {
+                    record.lapse_refresh_timer();
+                    None
+                }
+            }
         } else {
-            false
+            return false;
+        };
+
+        if let Some((inbox, timer)) = timer {
+            self.push_or_release(inbox, timer);
+        }
+        true
+    }
+
+    /// Hands a batch of hits an L1 copy served over to its L2 record, which
+    /// holds the counters refresh eligibility and eviction read. Runs at most
+    /// once per second per thread and name; a record gone in the meantime
+    /// just drops the batch.
+    fn record_l1_hits(&self, domain: &str, record_type: RecordType, hits: u16) {
+        let key = CacheKey::from_lowercase(domain, record_type);
+        if let Some(entry) = self.cache.get(&key) {
+            let record = entry.value();
+            record.record_hits(u64::from(hits));
+            if record.is_refresh_parked() {
+                self.rearm_refresh(&key, record);
+            }
         }
     }
 
@@ -693,7 +797,7 @@ impl DnsCache {
             } else {
                 record.expires_at_secs
             };
-            l1_insert(
+            let batched = l1_insert(
                 domain,
                 record_type,
                 Arc::clone(&entry.addresses),
@@ -701,6 +805,9 @@ impl DnsCache {
                 record.is_local_dns(),
                 expires_secs,
             );
+            if batched > 0 {
+                record.record_hits(u64::from(batched));
+            }
         }
     }
 

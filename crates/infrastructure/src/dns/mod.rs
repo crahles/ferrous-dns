@@ -21,11 +21,11 @@ pub mod wire_response;
 
 pub use block_filter::BlockFilterEngine;
 pub use cache::{
-    CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord, DnsCache, DnsCacheAccess,
-    DnsCacheConfig, EvictionStrategy, LocalRecordStatus, RefreshRequest, RefreshScanOptions,
-    RefreshSenders,
+    CachedAddresses, CachedData, CachedDnssecStatus, CachedRecord, ColdThresholds, DnsCache,
+    DnsCacheAccess, DnsCacheConfig, EvictionStrategy, LocalRecordStatus, RefreshRequest,
+    RefreshSchedule, RefreshSenders, ScheduledRefresh, TimerInbox,
 };
-pub use cache_maintenance::{DnsCacheMaintenance, RefreshPace};
+pub use cache_maintenance::DnsCacheMaintenance;
 pub use dga_detection::DgaDetector;
 pub use load_balancer::{
     HealthChecker, PoolManager, ServerHealth, ServerStatus, UpstreamHealthAdapter,

@@ -1,68 +1,98 @@
 use super::cache::negative_cache::negative_ttl;
 use super::cache::{
-    coarse_clock, CachedAddresses, CachedData, CachedDnssecStatus, DnsCache, RefreshRequest,
-    RefreshScanOptions,
+    coarse_clock, CachedAddresses, CachedData, CachedDnssecStatus, ColdThresholds, DnsCache,
+    DueRefresh, RefreshRequest, RefreshSchedule, TimerInbox,
 };
 
 use async_trait::async_trait;
 use ferrous_dns_application::ports::{
-    CacheCompactionOutcome, CacheMaintenancePort, CacheRefreshOutcome, DnsResolver,
-    QueryLogRepository,
+    CacheCompactionOutcome, CacheMaintenancePort, DnsResolver, QueryLogRepository,
 };
-use ferrous_dns_domain::{DnsQuery, DomainError, QueryLog, QuerySource, RecordType};
+use ferrous_dns_domain::{DnsQuery, DnssecStatus, DomainError, QueryLog, QuerySource, RecordType};
+use std::collections::{BinaryHeap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info};
 
-/// Minimum bloom rotation interval in refresh cycles. Rotation re-seeds every
-/// live key, so this only bounds how often that `O(entries)` pass runs.
+/// Minimum bloom rotation interval in maintenance cycles. Rotation re-seeds
+/// every live key, so this only bounds how often that `O(entries)` pass runs.
 const MIN_BLOOM_ROTATION_CYCLES: u64 = 3;
 
-/// Below this the pacer stops trying. The timer cannot honour sub-millisecond
-/// sleeps anyway, and a backlog needing that rate is already spread far finer
-/// than the concurrency limit that actually bounds upstream load.
-const MIN_PACER_PERIOD: Duration = Duration::from_millis(1);
+/// Renewals running at once. This bounds the upstream load refreshes put on
+/// at any instant, and is the only limit on them: throughput follows what is
+/// due, so no cache size outgrows it.
+const MAX_CONCURRENT_REFRESHES: usize = 16;
 
-/// Channel carrying the current drain period to the refresh worker. `None`
-/// means drain freely.
-pub type RefreshPace = Option<Duration>;
+/// Timers held, as a multiple of `cache_max_entries`, before the worker
+/// sweeps out those whose entry was evicted or removed.
+const SWEEP_FACTOR: usize = 2;
 
-/// Why an entry reached the worker, derived from which queue it arrived on.
+/// Timers one tick of a sweep looks at, so a sweep spreads over seconds
+/// rather than holding up the repairs queued behind it.
+const SWEEP_BUDGET: usize = 16_384;
+
+/// Why an entry reached the worker.
 ///
-/// The two service levels are not interchangeable: `Stale` means a client has
-/// already been served a stale answer and is waiting on the real one, while
-/// `Optimistic` is best-effort prefetching the worker is free to pace.
+/// `Stale` means a client has already been served a stale answer and is
+/// waiting on the real one, so it always goes first. `Due` and `Retry` are
+/// renewals on a timer, which may decline an answer that would not extend
+/// the entry; see [`RefreshOrigin::retry_in`] for what each gets after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshOrigin {
     Stale,
-    Optimistic,
+    Due,
+    Retry,
 }
 
-/// Waits out the current pacing period, then takes the next optimistic item.
-///
-/// The order matters twice over. Sleeping *before* receiving keeps the arm
-/// cancel-safe: `select!` may drop this future when a stale item wins, and the
-/// worst that costs is one abandoned sleep, never a dropped message. Sleeping
-/// *inside* the arm's future rather than after the item is in hand is what
-/// keeps the stale arm responsive — the wait happens as part of arm selection,
-/// so `select!` is still polling the stale receiver throughout it.
-///
-/// The period is re-read on every call, so a cycle that publishes a new one
-/// takes effect from the next item rather than at the end of the backlog.
-async fn paced_recv(
-    pace: &watch::Receiver<RefreshPace>,
-    rx: &mut mpsc::Receiver<RefreshRequest>,
-) -> Option<RefreshRequest> {
-    // Copied out before the await: the borrow guard is not `Send`, and holding
-    // it across the sleep would make the whole worker task non-`Send`.
-    let period = *pace.borrow();
-    if let Some(period) = period {
-        tokio::time::sleep(period).await;
+/// What a renewal that got an answer did with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// Stored, and the next timer armed.
+    Renewed,
+    /// Not stored: it would have ended the entry no later than it already
+    /// ends. A caching upstream answers with what is left of its own copy,
+    /// and two anycast nodes can be minutes apart; taking a copy that ends
+    /// sooner cuts a valid answer short, and one that ends at the same second
+    /// is the copy the entry already holds.
+    Declined,
+    /// Removed: the answer validated as Bogus.
+    Removed,
+    /// Not stored, and the entry kept as it was: validation could not run,
+    /// the answer held nothing to store, or the cache refused it.
+    Kept,
+}
+
+impl RefreshOrigin {
+    /// Seconds from now to the next attempt a renewal on a timer that did
+    /// not renew the entry gets, given the life the entry has left.
+    ///
+    /// A declined answer is tried again a second before expiry, when another
+    /// copy upstream may already have rolled over, and if declined again, at
+    /// expiry, where any answer is taken: an expired entry never declines, so
+    /// that ends it in at most three queries. Every upstream answering
+    /// SERVFAIL is usually transient, so a first timer gets one retry halfway
+    /// through what is left. Any other case is left to compaction, or to
+    /// serve-stale once the entry expires.
+    fn retry_in(
+        self,
+        outcome: &Result<RefreshOutcome, DomainError>,
+        remaining_secs: u64,
+    ) -> Option<u64> {
+        match (self, outcome) {
+            (Self::Due, Ok(RefreshOutcome::Declined)) if remaining_secs >= 2 => {
+                Some(remaining_secs - 1)
+            }
+            (Self::Due | Self::Retry, Ok(RefreshOutcome::Declined)) => Some(remaining_secs),
+            (Self::Due, Err(DomainError::AllUpstreamsServfail)) if remaining_secs >= 2 => {
+                Some(remaining_secs / 2)
+            }
+            _ => None,
+        }
     }
-    rx.recv().await
 }
 
 /// Infrastructure adapter implementing `CacheMaintenancePort`.
@@ -72,35 +102,24 @@ pub struct DnsCacheMaintenance {
     bloom_cycle_counter: AtomicU64,
     /// Number of maintenance cycles between bloom rotations.
     bloom_rotation_cycles: u64,
-    /// How often a cycle runs. Load-bearing: it is the window a cycle's backlog
-    /// is spread across, so it must match what actually drives the job.
-    refresh_interval_secs: u64,
-    /// Absent when `cache_optimistic_refresh` is off.
-    refresh: Option<OptimisticRefresh>,
-}
-
-struct OptimisticRefresh {
-    /// Eligibility and priority knobs handed to each scan.
-    scan_opts: RefreshScanOptions,
-    /// Publishes the drain period the worker should honour.
-    pace_tx: watch::Sender<RefreshPace>,
 }
 
 impl DnsCacheMaintenance {
-    /// Eviction, bloom rotation and compaction only; add refresh with
-    /// [`Self::with_optimistic_refresh`].
-    pub fn new(cache: Arc<DnsCache>, refresh_interval_secs: u64) -> Self {
+    /// Eviction and bloom rotation, run every `cycle_interval_secs`, and
+    /// compaction. Renewals do not depend on that cadence: they run on
+    /// [`Self::start_refresh_worker`].
+    pub fn new(cache: Arc<DnsCache>, cycle_interval_secs: u64) -> Self {
         // Rotation only bounds how long bits left behind by removed keys
         // linger: `rotate_bloom` re-seeds every live entry into the new slot,
         // so an entry's visibility does not depend on this cadence.
         let min_ttl = cache.min_ttl() as u64;
-        let interval = refresh_interval_secs.max(1);
+        let interval = cycle_interval_secs.max(1);
         let bloom_rotation_cycles = (min_ttl / interval).max(MIN_BLOOM_ROTATION_CYCLES);
 
         info!(
             bloom_rotation_cycles,
             min_ttl,
-            refresh_interval_secs,
+            cycle_interval_secs,
             "Bloom rotation throttled to every {} maintenance cycles (~{} seconds)",
             bloom_rotation_cycles,
             bloom_rotation_cycles * interval,
@@ -110,29 +129,21 @@ impl DnsCacheMaintenance {
             cache,
             bloom_cycle_counter: AtomicU64::new(0),
             bloom_rotation_cycles,
-            refresh_interval_secs: interval,
-            refresh: None,
         }
     }
 
-    /// Enables the optimistic refresh scan; its worker is started separately
-    /// with [`Self::start_refresh_worker`].
-    pub fn with_optimistic_refresh(
-        mut self,
-        scan_opts: RefreshScanOptions,
-        pace_tx: watch::Sender<RefreshPace>,
-    ) -> Self {
-        self.refresh = Some(OptimisticRefresh { scan_opts, pace_tx });
-        self
-    }
-
+    /// Resolves `domain` again and stores the answer. A serve-stale repair
+    /// has a client waiting and always stores; a renewal on a timer declines
+    /// an answer that would not extend a live entry (see
+    /// [`RefreshOutcome::Declined`]).
     async fn refresh_entry(
         cache: &DnsCache,
         resolver: &dyn DnsResolver,
         query_log: Option<&dyn QueryLogRepository>,
         domain: &str,
         record_type: &RecordType,
-    ) -> Result<bool, DomainError> {
+        origin: RefreshOrigin,
+    ) -> Result<RefreshOutcome, DomainError> {
         let start = Instant::now();
 
         debug!(
@@ -145,14 +156,19 @@ impl DnsCacheMaintenance {
         let resolution = resolver.resolve(&query).await?;
         let response_time = start.elapsed().as_micros() as u64;
 
-        // Unvalidated answers are never cached, so the stale one goes rather than
-        // being renewed: under Strict the next query must SERVFAIL, not hit.
-        if resolution
-            .dnssec_status
-            .is_some_and(|status| status.is_unvalidated())
-        {
-            cache.remove(domain, record_type);
-            return Ok(false);
+        // A Bogus answer is a verdict on the zone: the entry goes rather than
+        // being renewed, so under Strict the next query SERVFAILs, not hits.
+        // Indeterminate only means validation could not run (a DS or DNSKEY
+        // lookup failed). The entry was validated when it was stored, so it
+        // keeps serving until its own TTL ends, and is not renewed with an
+        // answer nobody validated.
+        match resolution.dnssec_status {
+            Some(DnssecStatus::Bogus) => {
+                cache.remove(domain, record_type);
+                return Ok(RefreshOutcome::Removed);
+            }
+            Some(DnssecStatus::Indeterminate) => return Ok(RefreshOutcome::Kept),
+            _ => {}
         }
 
         let new_data = if !resolution.addresses.is_empty() {
@@ -162,7 +178,7 @@ impl DnsCacheMaintenance {
         } else if let Some(wire_bytes) = &resolution.upstream_wire_data {
             CachedData::WireData(wire_bytes.clone())
         } else {
-            return Ok(false);
+            return Ok(RefreshOutcome::Kept);
         };
         let dnssec_status = resolution.dnssec_status.map(CachedDnssecStatus::from);
         // An answer without records is NXDOMAIN or NODATA: keeping the entry's
@@ -171,8 +187,17 @@ impl DnsCacheMaintenance {
             .min_ttl
             .unwrap_or_else(|| negative_ttl(resolution.negative_soa_ttl));
 
+        // Only a positive answer to a live entry is declined: past expiry any
+        // answer beats a stale one, and a negative TTL is the zone's own.
+        if origin != RefreshOrigin::Stale && resolution.min_ttl.is_some() {
+            let remaining = cache.get_remaining_ttl(domain, record_type).unwrap_or(0);
+            if remaining > 0 && cache.clamp_ttl(ttl) <= remaining {
+                return Ok(RefreshOutcome::Declined);
+            }
+        }
+
         if !cache.refresh_record(domain, record_type, Some(ttl), new_data, dnssec_status) {
-            return Ok(false);
+            return Ok(RefreshOutcome::Kept);
         }
 
         if let Some(log) = query_log {
@@ -213,134 +238,223 @@ impl DnsCacheMaintenance {
             "Cache entry refreshed with new DNSSEC validation"
         );
 
-        Ok(true)
+        Ok(RefreshOutcome::Renewed)
     }
 
-    /// Spawns the background worker that drains both refresh queues.
+    /// Spawns the worker that renews cache entries.
     ///
-    /// Pacing applies **only** to the optimistic queue, and its period is set
-    /// by the maintenance cycle rather than configured: a cycle divides its own
-    /// interval by the backlog it just produced, so the work lands evenly
-    /// across the interval instead of as a burst — at whatever rate the backlog
-    /// actually requires. What bounds instantaneous upstream load is
-    /// `MAX_CONCURRENT_REFRESHES`, not the pacing.
-    ///
-    /// The stale queue is drained unpaced and is polled first on every
-    /// iteration, so a serve-stale repair never waits behind an optimistic
-    /// backlog. The task ends when both senders are dropped.
+    /// It takes serve-stale repairs from `stale_rx`, always first, and the
+    /// refresh timers the cache arms in `timers` as it stores and renews
+    /// entries. Each second it collects the timers armed since the last tick
+    /// and claims those that came due. Up to `MAX_CONCURRENT_REFRESHES`
+    /// renewals run at once; when more are due, hot ones (by `thresholds`)
+    /// go first. `timers` is `None` with optimistic refresh off, and only
+    /// repairs arrive.
     pub fn start_refresh_worker(
         cache: Arc<DnsCache>,
         resolver: Arc<dyn DnsResolver>,
         query_log: Option<Arc<dyn QueryLogRepository>>,
-        mut stale_rx: mpsc::Receiver<RefreshRequest>,
-        mut optimistic_rx: mpsc::Receiver<RefreshRequest>,
-        pace: watch::Receiver<RefreshPace>,
-        min_lead_secs: u64,
+        stale_rx: mpsc::Receiver<RefreshRequest>,
+        timers: Option<Arc<TimerInbox>>,
+        thresholds: ColdThresholds,
     ) {
-        const MAX_CONCURRENT_REFRESHES: usize = 16;
+        let base_sweep_at = cache.max_entries().saturating_mul(SWEEP_FACTOR);
+        let worker = RefreshWorker {
+            cache,
+            resolver,
+            query_log,
+            thresholds,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES)),
+            timers,
+            schedule: RefreshSchedule::default(),
+            stale: VecDeque::new(),
+            due: BinaryHeap::new(),
+            base_sweep_at,
+            sweep_at: base_sweep_at,
+            sweep_from: None,
+        };
+        tokio::spawn(worker.run(stale_rx));
+    }
+}
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES));
+struct RefreshWorker {
+    cache: Arc<DnsCache>,
+    resolver: Arc<dyn DnsResolver>,
+    query_log: Option<Arc<dyn QueryLogRepository>>,
+    thresholds: ColdThresholds,
+    permits: Arc<Semaphore>,
+    /// Collected on the tick; arming a timer never wakes this task.
+    timers: Option<Arc<TimerInbox>>,
+    schedule: RefreshSchedule,
+    /// Repairs waiting for a permit, in arrival order.
+    stale: VecDeque<RefreshRequest>,
+    /// Claimed renewals waiting for a permit, most urgent first.
+    due: BinaryHeap<DueRefresh>,
+    /// The fewest timers a sweep ever waits for.
+    base_sweep_at: usize,
+    /// Timer count past which a sweep starts. A cache over its capacity can
+    /// hold more live timers than the base, so each sweep sets it from what
+    /// it left, which keeps sweeps from running back to back.
+    sweep_at: usize,
+    /// The second the sweep in progress resumes from.
+    sweep_from: Option<u64>,
+}
 
-        tokio::spawn(async move {
-            loop {
-                // `biased` polls the stale arm first, so a ready serve-stale
-                // repair always wins over an optimistic item — including one
-                // whose pacing period elapsed in the same wakeup.
-                let (domain, record_type, origin) = tokio::select! {
-                    biased;
+impl RefreshWorker {
+    async fn run(mut self, mut stale_rx: mpsc::Receiver<RefreshRequest>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut stale_open = true;
 
-                    Some((domain, record_type)) = stale_rx.recv() => {
-                        (domain, record_type, RefreshOrigin::Stale)
-                    }
-
-                    Some((domain, record_type)) = paced_recv(&pace, &mut optimistic_rx) => {
-                        (domain, record_type, RefreshOrigin::Optimistic)
-                    }
-
-                    else => {
-                        info!("Refresh queue listener: channels closed, shutting down");
-                        break;
-                    }
-                };
-
-                // A stale item already holds the in-flight claim, taken by the
-                // lookup that queued it. An optimistic one only holds a queue
-                // claim, and may have spent most of a cycle waiting — long
-                // enough for a serve-stale repair to have renewed it already.
-                // Converting the claim here is what keeps that from becoming a
-                // second, pointless upstream query.
-                if origin == RefreshOrigin::Optimistic
-                    && !cache.claim_queued_for_refresh(&domain, &record_type, min_lead_secs)
-                {
-                    continue;
-                }
-
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let cache = Arc::clone(&cache);
-                let resolver = Arc::clone(&resolver);
-                let query_log = query_log.clone();
-                tokio::spawn(async move {
-                    match Self::refresh_entry(
-                        &cache,
-                        resolver.as_ref(),
-                        query_log.as_deref(),
-                        &domain,
-                        &record_type,
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            // `cache_optimistic_refreshes` counts background
-                            // prefetches, not serve-stale repairs.
-                            if origin == RefreshOrigin::Optimistic {
-                                cache
-                                    .metrics()
-                                    .optimistic_refreshes
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                            }
-                            debug!(
-                                domain = %domain,
-                                record_type = %record_type,
-                                ?origin,
-                                "Cache entry refreshed"
-                            );
-                        }
-                        Ok(false) => {
-                            cache.reset_refreshing(&domain, &record_type);
-                        }
-                        Err(e) => {
-                            debug!(
-                                domain = %domain,
-                                ?origin,
-                                error = %e,
-                                "Background refresh failed"
-                            );
-                            cache.reset_refreshing(&domain, &record_type);
-                        }
-                    }
-                    drop(permit);
-                });
+        loop {
+            let has_work = !self.stale.is_empty() || !self.due.is_empty();
+            if !stale_open && !has_work {
+                info!("Refresh worker: repair channel closed, shutting down");
+                break;
             }
+
+            // `biased` keeps the arms in this order: a repair a client waits
+            // on, then what came due, then starting work.
+            tokio::select! {
+                biased;
+
+                request = stale_rx.recv(), if stale_open => match request {
+                    Some(request) => self.stale.push_back(request),
+                    None => stale_open = false,
+                },
+
+                _ = tick.tick() => self.claim_due(),
+
+                permit = Arc::clone(&self.permits).acquire_owned(), if has_work => {
+                    let Ok(permit) = permit else { break };
+                    self.start_next(permit);
+                }
+            }
+        }
+    }
+
+    /// Registers every timer armed since the last tick.
+    fn collect_timers(&mut self) {
+        if let Some(timers) = &self.timers {
+            let schedule = &mut self.schedule;
+            timers.drain(|timer| schedule.register(timer));
+        }
+    }
+
+    fn claim_due(&mut self) {
+        // In step with the clock the records are stamped with, so a timer
+        // fires on its second, not up to a second after it.
+        coarse_clock::tick();
+        self.collect_timers();
+        let now = coarse_clock::coarse_now_secs();
+        for timer in self.schedule.take_due(now) {
+            if let Some(due) = self.cache.claim_due_refresh(&timer, now, &self.thresholds) {
+                self.due.push(due);
+            }
+        }
+        self.sweep_step();
+    }
+
+    /// Drops a slice of the timers whose entry is gone. They would cost
+    /// nothing when they fire, but under eviction churn they pile up for as
+    /// long as the longest TTL.
+    fn sweep_step(&mut self) {
+        let from = match self.sweep_from {
+            Some(from) => from,
+            None if self.schedule.len() > self.sweep_at => 0,
+            None => return,
+        };
+        let cache = &self.cache;
+        self.sweep_from = self
+            .schedule
+            .sweep(from, SWEEP_BUDGET, |key| cache.holds(key));
+        if self.sweep_from.is_none() {
+            self.sweep_at = self
+                .base_sweep_at
+                .max(self.schedule.len().saturating_mul(SWEEP_FACTOR));
+        }
+    }
+
+    fn start_next(&mut self, permit: OwnedSemaphorePermit) {
+        let (domain, record_type, origin) =
+            if let Some((domain, record_type)) = self.stale.pop_front() {
+                (domain, record_type, RefreshOrigin::Stale)
+            } else if let Some(due) = self.due.pop() {
+                let now = coarse_clock::coarse_now_secs();
+                if !self.cache.start_claimed_refresh(&due.key, now) {
+                    return;
+                }
+                let origin = if due.retry {
+                    RefreshOrigin::Retry
+                } else {
+                    RefreshOrigin::Due
+                };
+                (
+                    Arc::from(due.key.domain.as_str()),
+                    due.key.record_type,
+                    origin,
+                )
+            } else {
+                return;
+            };
+
+        let cache = Arc::clone(&self.cache);
+        let resolver = Arc::clone(&self.resolver);
+        let query_log = self.query_log.clone();
+        tokio::spawn(async move {
+            let outcome = DnsCacheMaintenance::refresh_entry(
+                &cache,
+                resolver.as_ref(),
+                query_log.as_deref(),
+                &domain,
+                &record_type,
+                origin,
+            )
+            .await;
+            Self::follow_up(&cache, &domain, record_type, origin, &outcome);
+            drop(permit);
         });
     }
 
-    /// Period that spreads `backlog` items evenly across one cycle interval.
-    ///
-    /// This is the whole pacing policy: a cycle's work is stretched over the
-    /// window before the next cycle produces more, so the queue drains steadily
-    /// instead of emptying in a burst and then idling. Because the divisor is
-    /// the real backlog, throughput follows demand rather than a fixed ceiling.
-    fn pace_for(&self, backlog: usize) -> RefreshPace {
-        let backlog = u32::try_from(backlog).unwrap_or(u32::MAX);
-        if backlog == 0 {
-            return None;
+    /// Everything that happens after a renewal, in one place. A renewal that
+    /// stored the answer armed the next timer itself. One that did not gets
+    /// its one more attempt here, if any, before it lets go of the entry:
+    /// arming it while the renewal still holds the entry is what keeps
+    /// compaction from arming a second one.
+    fn follow_up(
+        cache: &DnsCache,
+        domain: &str,
+        record_type: RecordType,
+        origin: RefreshOrigin,
+        outcome: &Result<RefreshOutcome, DomainError>,
+    ) {
+        match outcome {
+            Ok(RefreshOutcome::Renewed) => {
+                // `cache_optimistic_refreshes` counts renewals ahead of
+                // expiry, not serve-stale repairs.
+                if origin != RefreshOrigin::Stale {
+                    cache
+                        .metrics()
+                        .optimistic_refreshes
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                debug!(domain = %domain, record_type = %record_type, ?origin, "Cache entry refreshed");
+                return;
+            }
+            Ok(other) => {
+                debug!(domain = %domain, ?origin, outcome = ?other, "Background refresh left the entry as it was");
+            }
+            Err(e) => {
+                debug!(domain = %domain, ?origin, error = %e, "Background refresh failed");
+            }
         }
-
-        let period = Duration::from_secs(self.refresh_interval_secs) / backlog;
-        (period >= MIN_PACER_PERIOD).then_some(period)
+        let remaining = cache
+            .get_remaining_ttl(domain, &record_type)
+            .map_or(0, u64::from);
+        if let Some(in_secs) = origin.retry_in(outcome, remaining) {
+            cache.schedule_retry(domain, record_type, in_secs);
+        }
+        cache.reset_refreshing(domain, &record_type);
     }
 }
 
@@ -372,106 +486,6 @@ impl CacheMaintenancePort for DnsCacheMaintenance {
         }
 
         Ok(())
-    }
-
-    async fn run_refresh_cycle(&self) -> Result<CacheRefreshOutcome, DomainError> {
-        let Some(refresh) = &self.refresh else {
-            return Ok(CacheRefreshOutcome {
-                cache_size: self.cache.len(),
-                ..Default::default()
-            });
-        };
-
-        let cache_for_scan = Arc::clone(&self.cache);
-        let scan_opts = refresh.scan_opts;
-        let mut candidates =
-            tokio::task::spawn_blocking(move || cache_for_scan.get_refresh_candidates(&scan_opts))
-                .await
-                .unwrap_or_default();
-
-        if candidates.is_empty() {
-            refresh.pace_tx.send_replace(None);
-            return Ok(CacheRefreshOutcome {
-                cache_size: self.cache.len(),
-                ..Default::default()
-            });
-        }
-
-        let candidate_count = candidates.len();
-
-        // The cycle only scans and enqueues; the worker refreshes at the pace
-        // this cycle publishes below, so a cycle's cost does not grow with the
-        // number of eligible entries.
-        let Some(tx) = self.cache.optimistic_refresh_sender() else {
-            // No worker wired up, so nothing would ever drain the queue —
-            // release the flags rather than stranding the entries.
-            for (domain, record_type) in &candidates {
-                self.cache.reset_refresh_queued(domain, record_type);
-            }
-            refresh.pace_tx.send_replace(None);
-            return Ok(CacheRefreshOutcome {
-                candidates_found: candidate_count,
-                cache_size: self.cache.len(),
-                ..Default::default()
-            });
-        };
-
-        // The queue is the per-cycle bound. `get_refresh_candidates` already
-        // ordered the list so that the tail is what costs least to lose, so
-        // cutting it here beats letting `try_send` reject in arrival order.
-        let free = tx.capacity();
-        let mut shed = 0usize;
-        if candidates.len() > free {
-            for (domain, record_type) in &candidates[free..] {
-                self.cache.reset_refresh_queued(domain, record_type);
-            }
-            shed = candidates.len() - free;
-            self.cache.note_refresh_shed(shed as u64);
-            candidates.truncate(free);
-        }
-
-        let mut enqueued = 0;
-        let mut dropped = 0;
-
-        for (domain, record_type) in &candidates {
-            if tx
-                .try_send((Arc::from(domain.as_str()), *record_type))
-                .is_ok()
-            {
-                enqueued += 1;
-            } else {
-                // Lost a race with another producer for the slot we counted on;
-                // release the claim and let a later cycle pick the entry up.
-                self.cache.reset_refresh_queued(domain, record_type);
-                dropped += 1;
-            }
-        }
-
-        // Everything now sitting in the queue, including whatever the worker
-        // has yet to drain from the previous cycle, gets spread across the
-        // interval before this cycle runs again.
-        let backlog = tx.max_capacity().saturating_sub(tx.capacity());
-        let pace = self.pace_for(backlog);
-        refresh.pace_tx.send_replace(pace);
-
-        debug!(
-            candidate_count,
-            enqueued,
-            dropped,
-            shed,
-            backlog,
-            period_ms = pace.map(|p| p.as_millis()),
-            "Optimistic refresh candidates handed to the paced queue"
-        );
-
-        Ok(CacheRefreshOutcome {
-            candidates_found: candidate_count,
-            enqueued,
-            dropped,
-            shed,
-            paced_period_ms: pace.map(|p| p.as_millis() as u64),
-            cache_size: self.cache.len(),
-        })
     }
 
     async fn run_compaction_cycle(&self) -> Result<CacheCompactionOutcome, DomainError> {
