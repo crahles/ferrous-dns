@@ -50,7 +50,14 @@ pub async fn init_database(
 pub async fn close_database(pools: &[SqlitePool]) {
     let close_all = async {
         for pool in pools {
-            pool.close().await;
+            // sqlx's close() returns once every permit is back, so a connection a job
+            // returns during that wait goes back into the idle queue, still open.
+            loop {
+                pool.close().await;
+                if pool.size() == 0 {
+                    break;
+                }
+            }
         }
     };
     match tokio::time::timeout(CLOSE_TIMEOUT, close_all).await {
@@ -69,5 +76,53 @@ async fn warm_page_cache(pool: &SqlitePool) {
     match result {
         Ok(rows) => info!(rows = rows.len(), "SQLite page cache warmed"),
         Err(e) => error!(error = %e, "SQLite warmup query failed (non-critical)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn test_close_database_closes_a_connection_returned_while_closing() {
+        let returning = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let (hook_returning, hook_resume) = (returning.clone(), resume.clone());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            // Parks the returning connection after sqlx checks whether the pool is
+            // closed and before it goes back into the idle queue: a job that finishes
+            // as SIGTERM arrives.
+            .after_release(move |_, _| {
+                let (returning, resume) = (hook_returning.clone(), hook_resume.clone());
+                Box::pin(async move {
+                    returning.notify_one();
+                    resume.notified().await;
+                    Ok(true)
+                })
+            })
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        drop(pool.acquire().await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5), returning.notified())
+            .await
+            .expect("the dropped connection never reached after_release");
+
+        let closing = close_database(std::slice::from_ref(&pool));
+        tokio::pin!(closing);
+        assert!(futures::poll!(&mut closing).is_pending());
+        resume.notify_one();
+        closing.await;
+
+        assert_eq!(
+            pool.size(),
+            0,
+            "a connection returned while closing is still open, so SQLite keeps the WAL"
+        );
     }
 }
