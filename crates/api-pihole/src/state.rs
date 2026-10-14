@@ -1,7 +1,8 @@
 use ferrous_dns_application::ports::BlockFilterEnginePort;
 use ferrous_dns_application::use_cases::{
-    AppPasswordLoginUseCase, GetTopAllowedDomainsUseCase, LoginUseCase, LogoutUseCase,
-    ValidateSessionUseCase, VerifyMfaUseCase,
+    AppPasswordLoginUseCase, GetClientActivityUseCase, GetMfaStatusUseCase,
+    GetQueryLogStorageUseCase, GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase,
+    LoginUseCase, LogoutUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
 };
 use ferrous_dns_application::use_cases::{
     CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
@@ -45,6 +46,9 @@ pub struct PiholeAuthState {
     pub app_password_login: Arc<AppPasswordLoginUseCase>,
     pub logout: Arc<LogoutUseCase>,
     pub validate_session: Arc<ValidateSessionUseCase>,
+    /// Whether the admin has TOTP enrolled, reported as `totp` in every
+    /// session object.
+    pub get_mfa_status: Arc<GetMfaStatusUseCase>,
 }
 
 impl PiholeAppState {
@@ -62,6 +66,9 @@ pub struct PiholeQueryState {
     pub get_top_blocked_domains: Arc<GetTopBlockedDomainsUseCase>,
     pub get_top_allowed_domains: Arc<GetTopAllowedDomainsUseCase>,
     pub get_top_clients: Arc<GetTopClientsUseCase>,
+    pub get_top_blocked_clients: Arc<GetTopBlockedClientsUseCase>,
+    pub get_client_activity: Arc<GetClientActivityUseCase>,
+    pub get_query_log_storage: Arc<GetQueryLogStorageUseCase>,
     pub get_recent_queries: Arc<GetRecentQueriesUseCase>,
 }
 
@@ -121,4 +128,7 @@ pub struct PiholeSystemState {
     /// Absent when the server runs without a config file.
     pub reload_config: Option<Arc<ReloadConfigUseCase>>,
     pub process_start: std::time::Instant,
+    /// Port the web server serves HTTPS on, or 0 for plain HTTP. Follows the
+    /// TLS material that actually loaded, never `[server.web_tls] enabled`.
+    pub https_port: u16,
 }

@@ -2,7 +2,7 @@ use super::helpers::{row_to_query_log, window_start_bucket};
 use super::rollup;
 use crate::repositories::{db_err, hours_ago_cutoff, seconds_ago_cutoff, sql_ts};
 use chrono::{TimeDelta, Utc};
-use ferrous_dns_application::ports::{PageAt, PagedQueryResult};
+use ferrous_dns_application::ports::{ClientActivity, PageAt, PagedQueryResult, QueryLogStorage};
 use ferrous_dns_domain::entities::query_log::{
     ClientProtocol, DnssecStats, DnssecStatusFilter, QueryCategory, QueryLogFilter,
 };
@@ -133,6 +133,7 @@ pub(super) async fn get_recent_paged(
     let dnssec_clause = match filter.dnssec_status {
         Some(DnssecStatusFilter::Any) => " AND q.dnssec_status IS NOT NULL",
         Some(DnssecStatusFilter::Is(_)) => " AND q.dnssec_status = ?",
+        Some(DnssecStatusFilter::NotValidated) => " AND q.dnssec_status IS NULL",
         None => "",
     };
     let dns64_clause = match filter.dns64_synthesized {
@@ -159,6 +160,16 @@ pub(super) async fn get_recent_paged(
         protocol_clause,
     ]
     .concat();
+    // A snapshot page counts its matches within the snapshot too.
+    let newest_id = match page {
+        PageAt::Snapshot { newest_id, .. } => Some(newest_id),
+        PageAt::Offset(_) | PageAt::Cursor(_) => None,
+    };
+    let snapshot_clause = if newest_id.is_some() {
+        " AND q.id <= ?"
+    } else {
+        ""
+    };
 
     // Binds the `?` of `filters`, in the order its fragments are concatenated.
     macro_rules! bind_filters {
@@ -230,15 +241,36 @@ pub(super) async fn get_recent_paged(
                         .fetch_all(pool)
                         .await
                 }
+                PageAt::Snapshot { newest_id, offset } => {
+                    let sql = format!(
+                        select_query_log!(
+                            " WHERE q.created_at >= ?
+                                AND q.query_source = 'client'
+                                AND q.id <= ?{filters}
+                              ORDER BY q.created_at DESC, q.id DESC
+                              LIMIT ? OFFSET ?"
+                        ),
+                        filters = filters
+                    );
+                    let q = sqlx::query(&sql).bind(&cutoff).bind(newest_id);
+                    bind_filters!(q)
+                        .bind(fetch_limit)
+                        .bind(i64::from(offset))
+                        .fetch_all(pool)
+                        .await
+                }
             }
         },
         async {
             let count_sql = format!(
                 "SELECT COUNT(*) as cnt FROM query_log q
                  LEFT JOIN clients c ON q.client_ip = c.ip_address
-                 WHERE q.query_source = 'client' AND q.created_at >= ?{filters}"
+                 WHERE q.query_source = 'client' AND q.created_at >= ?{snapshot_clause}{filters}"
             );
-            let q = sqlx::query(&count_sql).bind(&cutoff);
+            let mut q = sqlx::query(&count_sql).bind(&cutoff);
+            if let Some(newest_id) = newest_id {
+                q = q.bind(newest_id);
+            }
             bind_filters!(q).fetch_one(pool).await
         },
         sqlx::query(
@@ -584,6 +616,7 @@ pub(super) async fn get_top_clients(
     pool: &SqlitePool,
     limit: u32,
     period_hours: f32,
+    blocked_only: bool,
 ) -> Result<Vec<(String, Option<String>, u64)>, DomainError> {
     let cutoff = hours_ago_cutoff(period_hours);
     let rows = sqlx::query(
@@ -592,11 +625,13 @@ pub(super) async fn get_top_clients(
          LEFT JOIN clients c ON q.client_ip = c.ip_address
          WHERE q.created_at >= ?
            AND q.query_source = 'client'
+           AND (? = 0 OR q.blocked = 1)
          GROUP BY q.client_ip
          ORDER BY count DESC
          LIMIT ?",
     )
     .bind(cutoff)
+    .bind(blocked_only)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
@@ -611,6 +646,81 @@ pub(super) async fn get_top_clients(
             (ip, hostname, count)
         })
         .collect())
+}
+
+/// Per-bucket counts from the raw log: the rollups do not keep the client.
+/// Clients outside `clients` come back with a NULL ip, one row per bucket.
+#[instrument(skip(pool, clients))]
+pub(super) async fn get_client_activity(
+    pool: &SqlitePool,
+    clients: &[String],
+    bucket_secs: u32,
+    period_hours: f32,
+) -> Result<Vec<ClientActivity>, DomainError> {
+    let cutoff = hours_ago_cutoff(period_hours);
+    let clients_json = serde_json::to_string(clients)
+        .map_err(|e| DomainError::InvalidInput(format!("invalid client list: {e}")))?;
+    let rows = sqlx::query(
+        "SELECT (CAST(strftime('%s', created_at) AS INTEGER) / ?) * ? AS bucket,
+                CASE WHEN client_ip IN (SELECT value FROM json_each(?))
+                     THEN client_ip END AS client,
+                COUNT(*) AS count
+         FROM query_log
+         WHERE created_at >= ?
+           AND query_source = 'client'
+         GROUP BY bucket, client
+         ORDER BY bucket ASC",
+    )
+    .bind(i64::from(bucket_secs))
+    .bind(i64::from(bucket_secs))
+    .bind(clients_json)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err("Failed to fetch client activity"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ClientActivity {
+            bucket: r.get("bucket"),
+            client_ip: r.get("client"),
+            count: r.get::<i64, _>("count") as u64,
+        })
+        .collect())
+}
+
+/// One pass over the client rows of the window index: the whole log, the
+/// period's share of it, and the oldest timestamp of each.
+#[instrument(skip(pool))]
+pub(super) async fn get_storage(
+    pool: &SqlitePool,
+    period_hours: f32,
+) -> Result<QueryLogStorage, DomainError> {
+    let cutoff = hours_ago_cutoff(period_hours);
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS stored,
+                COALESCE(CAST(strftime('%s', MIN(created_at)) AS REAL), 0.0) AS stored_earliest,
+                COALESCE(SUM(created_at >= ?), 0) AS recent,
+                COALESCE(CAST(strftime('%s', MIN(CASE WHEN created_at >= ? THEN created_at END)) AS REAL), 0.0) AS recent_earliest,
+                COALESCE(MAX(id), 0) AS newest_id,
+                sqlite_version() AS sqlite_version
+         FROM query_log
+         WHERE query_source = 'client'",
+    )
+    .bind(&cutoff)
+    .bind(&cutoff)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err("Failed to read query log storage"))?;
+
+    Ok(QueryLogStorage {
+        recent_queries: row.get::<i64, _>("recent") as u64,
+        recent_earliest: row.get("recent_earliest"),
+        stored_queries: row.get::<i64, _>("stored") as u64,
+        stored_earliest: row.get("stored_earliest"),
+        newest_id: row.get("newest_id"),
+        sqlite_version: row.get("sqlite_version"),
+    })
 }
 
 pub(super) async fn delete_older_than(pool: &SqlitePool, days: u32) -> Result<u64, DomainError> {

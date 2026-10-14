@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod ftl;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -15,15 +16,19 @@ use ferrous_dns_application::use_cases::{
     CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
     CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
     DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
-    GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
-    GetRegexFiltersUseCase, GetTimelineUseCase, GetTopAllowedDomainsUseCase,
-    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetWhitelistSourcesUseCase,
-    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateGroupUseCase,
-    UpdateManagedDomainUseCase, UpdateRegexFilterUseCase, UpdateWhitelistSourceUseCase,
+    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientActivityUseCase,
+    GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase, GetQueryLogStorageUseCase,
+    GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
+    GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase, GetTopBlockedDomainsUseCase,
+    GetTopClientsUseCase, GetWhitelistSourcesUseCase, UpdateBlocklistSourceUseCase,
+    UpdateClientUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
+    UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::config::DatabaseConfig;
-use ferrous_dns_domain::{BlockSource, Config, DomainError};
+use ferrous_dns_domain::{
+    AllowMatch, AllowMatchKind, BlockMatch, BlockMatchKind, BlockSource, Config, DomainError,
+    FilterExplanation, MatchType,
+};
 use ferrous_dns_infrastructure::repositories::{
     blocklist_source_repository::SqliteBlocklistSourceRepository,
     client_repository::SqliteClientRepository, group_repository::SqliteGroupRepository,
@@ -43,11 +48,25 @@ use tokio::sync::RwLock;
 pub const MOCK_GROUPED_CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 pub const MOCK_CLIENT_GROUP: i64 = 2;
 
+/// Database ids the mock engine's `explain` attributes its matches to. A
+/// test that creates the rows in order on a fresh database gets these ids.
+pub const MOCK_BLOCKLIST_ID: i64 = 1;
+pub const MOCK_GROUP_BLOCKLIST_ID: i64 = 2;
+pub const MOCK_DENY_REGEX_ID: i64 = 1;
+pub const MOCK_ALLOW_REGEX_ID: i64 = 2;
+
+/// How long before the app was built the test process "started", so uptimes
+/// are large enough to tell seconds from milliseconds.
+pub const PROCESS_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Domain decisions of the mock engine:
-/// - `regex.blocked.test` → blocked by a regex filter
-/// - `list.blocked.test` → blocked by a blocklist
-/// - `allowlisted.test` → explicitly allowed
-/// - `group.blocked.test` → blocked by a blocklist in [`MOCK_CLIENT_GROUP`] only
+/// - `regex.blocked.test` → blocked by the deny regex [`MOCK_DENY_REGEX_ID`]
+/// - `list.blocked.test` → blocked by the blocklist [`MOCK_BLOCKLIST_ID`]
+///   and by the manual blocklist, which has no id
+/// - `allowlisted.test` → explicitly allowed by an allowlist (no id) and by
+///   the allow regex [`MOCK_ALLOW_REGEX_ID`]
+/// - `group.blocked.test` → blocked by the blocklist
+///   [`MOCK_GROUP_BLOCKLIST_ID`] in [`MOCK_CLIENT_GROUP`] only
 /// - anything else → allowed
 struct MockBlockFilterEngine {
     blocking_enabled: AtomicBool,
@@ -75,8 +94,67 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
         }
     }
 
-    fn explain(&self, _domain: &str, _group_id: i64) -> ferrous_dns_domain::FilterExplanation {
-        unimplemented!()
+    fn explain(&self, domain: &str, group_id: i64) -> FilterExplanation {
+        let block = |kind, source_id, match_type| BlockMatch {
+            kind,
+            source_id,
+            name: String::new(),
+            match_type,
+        };
+        let allow = |kind, source_id, match_type| AllowMatch {
+            kind,
+            source_id,
+            name: String::new(),
+            match_type,
+        };
+        let (allow_reasons, block_matches) = match domain {
+            "regex.blocked.test" => (
+                vec![],
+                vec![block(
+                    BlockMatchKind::Regex,
+                    Some(MOCK_DENY_REGEX_ID),
+                    MatchType::Regex,
+                )],
+            ),
+            "list.blocked.test" => (
+                vec![],
+                vec![
+                    block(
+                        BlockMatchKind::Blocklist,
+                        Some(MOCK_BLOCKLIST_ID),
+                        MatchType::Exact,
+                    ),
+                    block(BlockMatchKind::Manual, None, MatchType::Exact),
+                ],
+            ),
+            "allowlisted.test" => (
+                vec![
+                    allow(AllowMatchKind::Allowlist, None, MatchType::Exact),
+                    allow(
+                        AllowMatchKind::Regex,
+                        Some(MOCK_ALLOW_REGEX_ID),
+                        MatchType::Regex,
+                    ),
+                ],
+                vec![],
+            ),
+            "group.blocked.test" if group_id == MOCK_CLIENT_GROUP => (
+                vec![],
+                vec![block(
+                    BlockMatchKind::Blocklist,
+                    Some(MOCK_GROUP_BLOCKLIST_ID),
+                    MatchType::Wildcard,
+                )],
+            ),
+            _ => (vec![], vec![]),
+        };
+        FilterExplanation {
+            domain: domain.to_string(),
+            group_id,
+            blocked: allow_reasons.is_empty() && !block_matches.is_empty(),
+            allow_reasons,
+            block_matches,
+        }
     }
     fn match_candidate(
         &self,
@@ -337,6 +415,11 @@ async fn build_pihole_state(
                 query_log_repo.clone(),
             )),
             get_top_clients: Arc::new(GetTopClientsUseCase::new(query_log_repo.clone())),
+            get_top_blocked_clients: Arc::new(GetTopBlockedClientsUseCase::new(
+                query_log_repo.clone(),
+            )),
+            get_client_activity: Arc::new(GetClientActivityUseCase::new(query_log_repo.clone())),
+            get_query_log_storage: Arc::new(GetQueryLogStorageUseCase::new(query_log_repo.clone())),
             get_recent_queries: Arc::new(GetRecentQueriesUseCase::new(query_log_repo.clone())),
         },
         blocking: PiholeBlockingState {
@@ -441,7 +524,10 @@ async fn build_pihole_state(
             cleanup_query_logs: Arc::new(CleanupOldQueryLogsUseCase::new(query_log_repo)),
             config: Arc::new(RwLock::new(config)),
             reload_config: None,
-            process_start: std::time::Instant::now(),
+            process_start: std::time::Instant::now()
+                .checked_sub(PROCESS_AGE)
+                .expect("monotonic clock is older than PROCESS_AGE"),
+            https_port: 0,
         },
         auth: auth::build_auth_state(totp_enrolled).await,
     }
@@ -451,6 +537,16 @@ async fn build_pihole_state(
 /// don't have to log in first.
 pub async fn create_pihole_test_app(pool: sqlx::SqlitePool) -> Router {
     create_pihole_router_with_openapi(build_pihole_state(pool, false, false).await).0
+}
+
+/// [`create_pihole_test_app`] with `configure` applied to its live config.
+pub async fn create_pihole_test_app_with_config(
+    pool: sqlx::SqlitePool,
+    configure: impl FnOnce(&mut Config),
+) -> Router {
+    let state = build_pihole_state(pool, false, false).await;
+    configure(&mut *state.system.config.write().await);
+    create_pihole_router_with_openapi(state).0
 }
 
 /// The OpenAPI document served next to [`create_pihole_test_app`].

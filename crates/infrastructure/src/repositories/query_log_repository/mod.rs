@@ -8,7 +8,9 @@ use crate::dns::cache::coarse_clock::coarse_now_secs;
 use async_trait::async_trait;
 use ferrous_dns_application::drop_counter::DropCounter;
 use ferrous_dns_application::ports::{
-    PageAt, PagedQueryResult, QueryLogRepository, TimeGranularity, TimelineBucket,
+    BlockedClientStatsRepository, ClientActivity, ClientActivityRepository, PageAt,
+    PagedQueryResult, QueryLogRepository, QueryLogStorage, QueryLogStorageRepository,
+    TimeGranularity, TimelineBucket,
 };
 use ferrous_dns_domain::entities::query_log::{DnssecStats, QueryLogFilter};
 use ferrous_dns_domain::{config::DatabaseConfig, DomainError, QueryLog, QueryStats};
@@ -180,10 +182,40 @@ impl QueryLogRepository for SqliteQueryLogRepository {
         limit: u32,
         period_hours: f32,
     ) -> Result<Vec<(String, Option<String>, u64)>, DomainError> {
-        reader::get_top_clients(&self.read_pool, limit, period_hours).await
+        reader::get_top_clients(&self.read_pool, limit, period_hours, false).await
     }
 
     async fn delete_older_than(&self, days: u32) -> Result<u64, DomainError> {
         reader::delete_older_than(&self.write_pool, days).await
+    }
+}
+
+#[async_trait]
+impl BlockedClientStatsRepository for SqliteQueryLogRepository {
+    async fn get_top_blocked_clients(
+        &self,
+        limit: u32,
+        period_hours: f32,
+    ) -> Result<Vec<(String, Option<String>, u64)>, DomainError> {
+        reader::get_top_clients(&self.read_pool, limit, period_hours, true).await
+    }
+}
+
+#[async_trait]
+impl ClientActivityRepository for SqliteQueryLogRepository {
+    async fn get_client_activity(
+        &self,
+        clients: &[String],
+        bucket_secs: u32,
+        period_hours: f32,
+    ) -> Result<Vec<ClientActivity>, DomainError> {
+        reader::get_client_activity(&self.read_pool, clients, bucket_secs, period_hours).await
+    }
+}
+
+#[async_trait]
+impl QueryLogStorageRepository for SqliteQueryLogRepository {
+    async fn get_storage(&self, period_hours: f32) -> Result<QueryLogStorage, DomainError> {
+        reader::get_storage(&self.read_pool, period_hours).await
     }
 }

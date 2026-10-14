@@ -1,4 +1,6 @@
-use axum::{middleware, Router};
+use std::sync::Arc;
+
+use axum::{middleware, Extension, Router};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -13,18 +15,20 @@ use crate::{
 /// Pi-hole dashboards, plugins, and automations work without modification;
 /// expose the spec under the same `nest` prefix (e.g. `/openapi.json` + `/docs`).
 ///
-/// As on Pi-hole, only `/auth` is public; every other route sits behind
-/// [`require_pihole_auth`].
+/// As on Pi-hole, only `/auth` and `/info/login` are public; every other
+/// route sits behind [`require_pihole_auth`].
 pub fn create_pihole_router_with_openapi(
     state: PiholeAppState,
 ) -> (Router, utoipa::openapi::OpenApi) {
     use utoipa::OpenApi;
 
-    let public_routes = OpenApiRouter::new().routes(routes!(
-        handlers::auth::get_session,
-        handlers::auth::login,
-        handlers::auth::logout
-    ));
+    let public_routes = OpenApiRouter::new()
+        .routes(routes!(
+            handlers::auth::get_session,
+            handlers::auth::login,
+            handlers::auth::logout
+        ))
+        .routes(routes!(handlers::info::get_login_info));
 
     let protected_routes = OpenApiRouter::new()
         .routes(routes!(handlers::stats::get_summary))
@@ -35,28 +39,17 @@ pub fn create_pihole_router_with_openapi(
         .routes(routes!(handlers::stats::get_top_domains))
         .routes(routes!(handlers::stats::get_upstreams))
         .routes(routes!(handlers::stats::get_recent_blocked))
-        // Aliases stay outside the spec to avoid duplicate operation ids.
+        .routes(routes!(handlers::stats::get_database_summary))
+        .routes(routes!(handlers::stats::get_database_top_domains))
+        .routes(routes!(handlers::stats::get_database_top_clients))
+        .routes(routes!(handlers::stats::get_database_upstreams))
+        .routes(routes!(handlers::stats::get_database_query_types))
+        // The Ferrous alias stays outside the spec to avoid a duplicate
+        // operation id.
         .route(
-            "/stats/database/summary",
-            axum::routing::get(handlers::stats::get_summary),
+            "/stats/history",
+            axum::routing::get(handlers::stats::get_history),
         )
-        .route(
-            "/stats/database/top_domains",
-            axum::routing::get(handlers::stats::get_top_domains),
-        )
-        .route(
-            "/stats/database/top_clients",
-            axum::routing::get(handlers::stats::get_top_clients),
-        )
-        .route(
-            "/stats/database/upstreams",
-            axum::routing::get(handlers::stats::get_upstreams),
-        )
-        .route(
-            "/stats/database/query_types",
-            axum::routing::get(handlers::stats::get_query_types),
-        )
-        .route("/history", axum::routing::get(handlers::stats::get_history))
         .routes(routes!(handlers::history::get_history_clients))
         .routes(routes!(handlers::queries::get_queries))
         .routes(routes!(handlers::queries::get_suggestions))
@@ -72,6 +65,7 @@ pub fn create_pihole_router_with_openapi(
             handlers::domains::create_domain
         ))
         .routes(routes!(
+            handlers::domains::get_domain,
             handlers::domains::update_domain,
             handlers::domains::delete_domain
         ))
@@ -85,6 +79,14 @@ pub fn create_pihole_router_with_openapi(
             handlers::lists::update_list,
             handlers::lists::delete_list
         ))
+        // FTL takes the rest of the URI as a list address, slashes and all.
+        // The route stays out of the spec, which documents it as `{list}`.
+        .route(
+            "/lists/{list}/{*rest}",
+            axum::routing::get(handlers::lists::get_list)
+                .put(handlers::lists::update_list)
+                .delete(handlers::lists::delete_list),
+        )
         .routes(routes!(handlers::lists::batch_delete))
         .routes(routes!(
             handlers::groups::list_all,
@@ -102,9 +104,17 @@ pub fn create_pihole_router_with_openapi(
         ))
         .routes(routes!(handlers::clients::suggestions))
         .routes(routes!(
+            handlers::clients::get_client,
             handlers::clients::update_client,
             handlers::clients::delete_client
         ))
+        // The same for a client subnet such as 10.0.0.0/24.
+        .route(
+            "/clients/{client}/{*rest}",
+            axum::routing::get(handlers::clients::get_client)
+                .put(handlers::clients::update_client)
+                .delete(handlers::clients::delete_client),
+        )
         .routes(routes!(handlers::clients::batch_delete))
         .routes(routes!(handlers::info::get_version))
         .routes(routes!(handlers::info::get_ftl_info))
@@ -114,14 +124,20 @@ pub fn create_pihole_router_with_openapi(
         .routes(routes!(handlers::action::gravity))
         .routes(routes!(handlers::action::restartdns))
         .routes(routes!(handlers::action::flush_logs))
+        .routes(routes!(handlers::padd::get_padd))
+        .routes(routes!(handlers::endpoints::get_endpoints))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_pihole_auth,
         ));
 
-    OpenApiRouter::with_openapi(PiholeApiDoc::openapi())
+    let (router, openapi) = OpenApiRouter::with_openapi(PiholeApiDoc::openapi())
         .merge(public_routes)
         .merge(protected_routes)
         .with_state(state)
-        .split_for_parts()
+        .split_for_parts();
+
+    // `/endpoints` lists the finished document, so it is built only now.
+    let endpoints = Arc::new(handlers::endpoints::list_endpoints(&openapi));
+    (router.layer(Extension(endpoints)), openapi)
 }

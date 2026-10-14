@@ -16,12 +16,15 @@ use super::UseCases;
 
 /// Constructs [`PiholeAppState`] by reusing the `Arc` use cases already
 /// wired for the Ferrous dashboard API — zero duplication of business logic.
+/// `https_port` is the port serving HTTPS, or 0 when the web server runs
+/// plain HTTP.
 pub fn build_pihole_state(
     use_cases: &UseCases,
     auth: &AuthServices,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
     config: Arc<RwLock<Config>>,
     reload_config: Option<Arc<ReloadConfigUseCase>>,
+    https_port: u16,
 ) -> PiholeAppState {
     PiholeAppState {
         query: PiholeQueryState {
@@ -30,6 +33,9 @@ pub fn build_pihole_state(
             get_top_blocked_domains: use_cases.get_top_blocked_domains.clone(),
             get_top_allowed_domains: use_cases.get_top_allowed_domains.clone(),
             get_top_clients: use_cases.get_top_clients.clone(),
+            get_top_blocked_clients: use_cases.get_top_blocked_clients.clone(),
+            get_client_activity: use_cases.get_client_activity.clone(),
+            get_query_log_storage: use_cases.get_query_log_storage.clone(),
             get_recent_queries: use_cases.get_queries.clone(),
         },
         blocking: PiholeBlockingState {
@@ -71,6 +77,7 @@ pub fn build_pihole_state(
             config,
             reload_config,
             process_start: std::time::Instant::now(),
+            https_port,
         },
         auth: PiholeAuthState {
             login: auth.use_cases.login.clone(),
@@ -78,6 +85,7 @@ pub fn build_pihole_state(
             app_password_login: auth.app_password_login.clone(),
             logout: auth.use_cases.logout.clone(),
             validate_session: auth.use_cases.validate_session.clone(),
+            get_mfa_status: auth.use_cases.get_mfa_status.clone(),
         },
     }
 }
