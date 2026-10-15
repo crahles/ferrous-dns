@@ -1,6 +1,6 @@
 use crate::ports::{PageAt, PagedQueryResult, QueryLogRepository};
 use ferrous_dns_domain::entities::query_log::{
-    ClientProtocol, DnssecStatusFilter, QueryCategory, QueryLog, QueryLogFilter,
+    ClientProtocol, DnssecStatusFilter, QueryCategory, QueryLog, QueryLogFilter, ReplyFilter,
 };
 use ferrous_dns_domain::{DomainError, RecordType};
 use std::sync::Arc;
@@ -31,6 +31,12 @@ pub struct PagedQueryInput<'a> {
     pub dns64: Option<bool>,
     /// Transport filter: `udp`, `tcp`, `dot`, `doh` or `doq`.
     pub protocol: Option<&'a str>,
+    /// Only queries logged before this Unix time.
+    pub until: Option<i64>,
+    /// Record types left out.
+    pub excluded_record_types: Vec<RecordType>,
+    /// Only queries answered with this kind of reply.
+    pub reply: Option<ReplyFilter>,
 }
 
 pub struct GetRecentQueriesUseCase {
@@ -88,6 +94,9 @@ impl GetRecentQueriesUseCase {
             dnssec_status: input.dnssec_status,
             dns64_synthesized: input.dns64,
             protocol: parsed_protocol,
+            until: input.until,
+            excluded_record_types: input.excluded_record_types.clone(),
+            reply: input.reply,
         };
 
         let max_limit = match input.page {

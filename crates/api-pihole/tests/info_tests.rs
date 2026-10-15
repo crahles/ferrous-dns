@@ -70,6 +70,131 @@ async fn version_contains_valid_semver() {
     );
 }
 
+#[tokio::test]
+async fn client_info_is_public_and_echoes_the_request() {
+    // api.c: /api/info/client is one of the few routes without require_auth.
+    let app =
+        helpers::create_pihole_test_app_with_auth(helpers::create_test_db().await, false).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/info/client")
+                .header("x-probe", "ferrous")
+                .body(Body::empty())
+                .expect("failed to build request"),
+        )
+        .await
+        .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read body")
+        .to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).expect("invalid JSON");
+    let client = helpers::ftl::assert_ftl_shape::<helpers::ftl::InfoClient>(&json);
+    assert_eq!(client.method, "GET");
+    assert_eq!(client.http_version, "1.1");
+    assert!(
+        client
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-probe") && h.value == "ferrous"),
+        "headers: {:?}",
+        client.headers
+    );
+}
+
+#[tokio::test]
+async fn sensors_match_the_ftl_schema() {
+    let app = helpers::create_pihole_test_app(helpers::create_test_db().await).await;
+
+    let (status, json) = helpers::send(app, "GET", "/info/sensors").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let sensors = helpers::ftl::assert_ftl_shape::<helpers::ftl::InfoSensors>(&json).sensors;
+    // FTL's defaults for webserver.api.temp.limit and .unit.
+    assert_eq!(sensors.hot_limit, 60.0);
+    assert_eq!(sensors.unit, "C");
+}
+
+#[tokio::test]
+async fn messages_list_is_empty() {
+    let app = helpers::create_pihole_test_app(helpers::create_test_db().await).await;
+
+    let (status, json) = helpers::send(app, "GET", "/info/messages").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let messages = helpers::ftl::assert_ftl_shape::<helpers::ftl::InfoMessages>(&json);
+    assert!(messages.messages.is_empty());
+}
+
+#[tokio::test]
+async fn metrics_report_the_cache_counters() {
+    let app = helpers::create_pihole_test_app(helpers::create_test_db().await).await;
+
+    let (status, json) = helpers::send(app, "GET", "/info/metrics").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let metrics = helpers::ftl::assert_ftl_shape::<helpers::ftl::InfoMetrics>(&json).metrics;
+    let cache = metrics.dns.cache;
+    // dnsmasq's cache-size is the capacity, as /padd reports it.
+    assert_eq!(
+        cache.size,
+        ferrous_dns_domain::Config::default().dns.cache_max_entries as u64
+    );
+    assert_eq!(cache.inserted, helpers::STUB_CACHE_INSERTIONS);
+    assert_eq!(cache.evicted, helpers::STUB_CACHE_EVICTIONS);
+    assert_eq!(cache.expired, helpers::STUB_CACHE_EXPIRED);
+    assert_eq!(metrics.dns.replies.sum, 0);
+    assert_eq!(metrics.dhcp.ack, 0);
+}
+
+#[tokio::test]
+async fn ftl_info_reports_cache_insertions_and_evictions_as_dnsmasq_counters() {
+    let pool = helpers::create_test_db().await;
+    let json = get_json(pool, "/info/ftl").await;
+
+    let dnsmasq = &json["ftl"]["dnsmasq"];
+    assert_eq!(
+        dnsmasq["dns_cache_inserted"],
+        helpers::STUB_CACHE_INSERTIONS
+    );
+    assert_eq!(
+        dnsmasq["dns_cache_live_freed"],
+        helpers::STUB_CACHE_EVICTIONS
+    );
+}
+
+#[tokio::test]
+async fn messages_count_is_zero() {
+    let app = helpers::create_pihole_test_app(helpers::create_test_db().await).await;
+
+    let (status, json) = helpers::send(app, "GET", "/info/messages/count").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        helpers::ftl::assert_ftl_shape::<helpers::ftl::Count>(&json).count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn deleting_messages_that_do_not_exist_is_an_empty_not_found() {
+    // info.c api_info_messages DELETE: nothing deleted → 404 with `{}`.
+    for ids in ["7", "1,2,3"] {
+        let app = helpers::create_pihole_test_app(helpers::create_test_db().await).await;
+
+        let (status, json) = helpers::send(app, "DELETE", &format!("/info/messages/{ids}")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "ids {ids}");
+        helpers::ftl::assert_ftl_shape::<helpers::ftl::Empty>(&json);
+    }
+}
+
 /// GETs `uri` from a fresh app over `pool`, asserting 200 and returning the JSON body.
 async fn get_json(pool: sqlx::SqlitePool, uri: &str) -> Value {
     let app = helpers::create_pihole_test_app(pool).await;
@@ -190,6 +315,28 @@ async fn system_info_reports_memory_in_kilobytes_and_three_loads() {
     assert!(system.cpu.nprocs > 0);
     assert_eq!(system.cpu.load.raw.len(), 3);
     assert_eq!(system.cpu.load.percent.len(), 3);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cpu_use_of_the_host_and_the_process_is_reported() {
+    // Busy for a moment, so this process has CPU time to show.
+    let started = std::time::Instant::now();
+    let mut spin = 0u64;
+    while started.elapsed() < std::time::Duration::from_millis(200) {
+        spin = std::hint::black_box(spin.wrapping_add(1));
+    }
+
+    for (uri, pointers) in [
+        ("/info/system", ["/system/cpu/%cpu", "/system/ftl/%cpu"]),
+        ("/info/ftl", ["/ftl/%cpu", "/ftl/%cpu"]),
+    ] {
+        let json = get_json(helpers::create_test_db().await, uri).await;
+        for pointer in pointers {
+            let cpu = json.pointer(pointer).and_then(Value::as_f64);
+            assert!(cpu.is_some_and(|cpu| cpu > 0.0), "{uri} {pointer}: {cpu:?}");
+        }
+    }
 }
 
 #[tokio::test]

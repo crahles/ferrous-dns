@@ -52,10 +52,11 @@ pub use blocklist_sources::{
 pub use cache::GetCacheStatsUseCase;
 pub use client_subnets::{
     CreateClientSubnetUseCase, DeleteClientSubnetUseCase, GetClientSubnetsUseCase,
+    UpdateClientSubnetUseCase,
 };
 pub use clients::{
     CleanupOldClientsUseCase, CreateManualClientUseCase, DeleteClientUseCase, GetClientsUseCase,
-    SyncArpCacheUseCase, SyncHostnamesUseCase, UpdateClientUseCase,
+    SetClientCommentUseCase, SyncArpCacheUseCase, SyncHostnamesUseCase, UpdateClientUseCase,
 };
 pub use config::{ConfigOverrides, ReloadConfigUseCase};
 pub use custom_services::{
@@ -78,7 +79,7 @@ pub use queries::{
     CleanupOldQueryLogsUseCase, GetClientActivityUseCase, GetQueryLogStorageUseCase,
     GetQueryRateUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase, GetTimelineUseCase,
     GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase, GetTopBlockedDomainsUseCase,
-    GetTopClientsUseCase, PagedQueryInput, QueryRate, RateUnit,
+    GetTopClientsUseCase, GetUniqueDomainsUseCase, PagedQueryInput, QueryRate, RateUnit,
 };
 pub use regex_filters::{
     CreateRegexFilterUseCase, DeleteRegexFilterUseCase, GetRegexFiltersUseCase,

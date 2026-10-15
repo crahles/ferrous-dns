@@ -460,6 +460,11 @@ async fn test_top_domains_split_by_verdict() {
         repo.get_distinct_recent_domains(2, 24.0).await.unwrap(),
         owned(&[("tracker.example.com", 5), ("safe.example.com", 4)])
     );
+    assert_eq!(
+        repo.count_distinct_domains(24.0).await.unwrap(),
+        3,
+        "client domains of either verdict; the internal lookup is left out"
+    );
 }
 
 #[tokio::test]
@@ -1234,6 +1239,9 @@ async fn test_combined_all_filters() {
         dnssec_status: None,
         dns64_synthesized: None,
         protocol: None,
+        until: None,
+        excluded_record_types: Vec::new(),
+        reply: None,
     };
     let result = repo(&pool)
         .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
@@ -1447,6 +1455,84 @@ async fn test_protocol_filter_keeps_only_matching_rows() {
     assert_eq!(page.records_filtered, 1);
     // The unfiltered total is unaffected by the protocol filter.
     assert_eq!(page.records_total, 3);
+}
+
+#[tokio::test]
+async fn test_get_recent_paged_until_and_excluded_types_narrow_the_page() {
+    let pool = migrated_pool().await;
+    let an_hour_ago = chrono::Utc::now().timestamp() - 3_600;
+    for (domain, record_type, created_at) in [
+        (
+            "old-a.example.com",
+            "A",
+            Some("datetime('now', '-2 hours')"),
+        ),
+        (
+            "old-caa.example.com",
+            "CAA",
+            Some("datetime('now', '-2 hours')"),
+        ),
+        ("new-a.example.com", "A", None),
+    ] {
+        insert(
+            &pool,
+            Row {
+                domain,
+                record_type,
+                ..Row::default()
+            },
+        )
+        .await;
+        if let Some(created_at) = created_at {
+            sqlx::query(&format!(
+                "UPDATE query_log SET created_at = {created_at} WHERE domain = ?"
+            ))
+            .bind(domain)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+    let page = |filter: QueryLogFilter| {
+        let pool = pool.clone();
+        async move {
+            repo(&pool)
+                .get_recent_paged(100, PageAt::Offset(0), 24.0, &filter)
+                .await
+                .unwrap()
+        }
+    };
+
+    let before = page(QueryLogFilter {
+        until: Some(an_hour_ago),
+        ..Default::default()
+    })
+    .await;
+    let not_a = page(QueryLogFilter {
+        excluded_record_types: vec![RecordType::A],
+        ..Default::default()
+    })
+    .await;
+
+    let names = |p: &ferrous_dns_application::ports::PagedQueryResult| {
+        p.queries
+            .iter()
+            .map(|q| q.domain.to_string())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        names(&before),
+        BTreeSet::from([
+            "old-a.example.com".to_string(),
+            "old-caa.example.com".to_string()
+        ])
+    );
+    assert_eq!(before.records_filtered, 2);
+    assert_eq!(
+        names(&not_a),
+        BTreeSet::from(["old-caa.example.com".to_string()])
+    );
+    assert_eq!(not_a.records_total, 3, "the total ignores the filters");
 }
 
 #[tokio::test]

@@ -361,6 +361,10 @@ impl QueryLogRepository for MockQueryLogRepository {
         Ok(Vec::new())
     }
 
+    async fn count_distinct_domains(&self, _period_hours: f32) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
     async fn get_top_clients(
         &self,
         _limit: u32,
@@ -454,6 +458,7 @@ impl ClientRepository for MockClientRepository {
             last_mac_update: None,
             last_hostname_update: None,
             group_id: Some(1),
+            comment: None,
         };
 
         clients.insert(id, client.clone());
@@ -485,6 +490,7 @@ impl ClientRepository for MockClientRepository {
             last_mac_update: None,
             last_hostname_update: None,
             group_id: Some(1),
+            comment: None,
         };
 
         clients.insert(id, client);
@@ -710,6 +716,15 @@ impl ClientRepository for MockClientRepository {
             )))
         }
     }
+
+    async fn set_comment(&self, id: i64, comment: Option<String>) -> Result<(), DomainError> {
+        let mut clients = self.clients.write().await;
+        let client = clients
+            .get_mut(&id)
+            .ok_or_else(|| DomainError::ClientNotFound(format!("Client {id} not found")))?;
+        client.comment = comment.map(Arc::from);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -774,6 +789,7 @@ impl BlocklistSourceRepository for MockBlocklistSourceRepository {
             created_at: Some("2026-01-01 00:00:00".to_string()),
             updated_at: Some("2026-01-01 00:00:00".to_string()),
             last_synced_at: None,
+            last_status: None,
         };
 
         sources.push(source.clone());
@@ -1031,6 +1047,7 @@ impl WhitelistSourceRepository for MockWhitelistSourceRepository {
             created_at: Some("2026-01-01 00:00:00".to_string()),
             updated_at: Some("2026-01-01 00:00:00".to_string()),
             last_synced_at: None,
+            last_status: None,
         };
 
         sources.push(source.clone());

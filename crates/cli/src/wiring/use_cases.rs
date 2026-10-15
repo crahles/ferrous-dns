@@ -15,12 +15,13 @@ use ferrous_dns_application::use_cases::{
     GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase,
     GetSafeSearchConfigsUseCase, GetScheduleProfilesUseCase, GetServiceCatalogUseCase,
     GetTimelineUseCase, GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase,
-    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetWhitelistSourcesUseCase,
-    GetWhitelistUseCase, ManageTimeSlotsUseCase, SyncArpCacheUseCase, SyncBlocklistSourcesUseCase,
+    GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetUniqueDomainsUseCase,
+    GetWhitelistSourcesUseCase, GetWhitelistUseCase, ManageTimeSlotsUseCase,
+    SetClientCommentUseCase, SyncArpCacheUseCase, SyncBlocklistSourcesUseCase,
     SyncHostnamesUseCase, TestDomainUseCase, ToggleSafeSearchUseCase, UnblockServiceUseCase,
-    UpdateBlocklistSourceUseCase, UpdateClientUseCase, UpdateCustomServiceUseCase,
-    UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
-    UpdateScheduleProfileUseCase, UpdateWhitelistSourceUseCase,
+    UpdateBlocklistSourceUseCase, UpdateClientSubnetUseCase, UpdateClientUseCase,
+    UpdateCustomServiceUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase,
+    UpdateRegexFilterUseCase, UpdateScheduleProfileUseCase, UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_infrastructure::dns::PoolManager;
 use ferrous_dns_infrastructure::system::{LinuxArpReader, PtrHostnameResolver};
@@ -32,6 +33,7 @@ pub struct UseCases {
     pub get_queries: Arc<GetRecentQueriesUseCase>,
     pub get_timeline: Arc<GetTimelineUseCase>,
     pub get_query_rate: Arc<GetQueryRateUseCase>,
+    pub get_unique_domains: Arc<GetUniqueDomainsUseCase>,
     pub get_blocklist: Arc<GetBlocklistUseCase>,
     pub get_block_filter_stats: Arc<GetBlockFilterStatsUseCase>,
     pub test_domain: Arc<TestDomainUseCase>,
@@ -56,8 +58,10 @@ pub struct UseCases {
     pub get_client_subnets: Arc<GetClientSubnetsUseCase>,
     pub create_client_subnet: Arc<CreateClientSubnetUseCase>,
     pub delete_client_subnet: Arc<DeleteClientSubnetUseCase>,
+    pub update_client_subnet: Arc<UpdateClientSubnetUseCase>,
     pub create_manual_client: Arc<CreateManualClientUseCase>,
     pub update_client: Arc<UpdateClientUseCase>,
+    pub set_client_comment: Arc<SetClientCommentUseCase>,
     pub delete_client: Arc<DeleteClientUseCase>,
     pub get_blocklist_sources: Arc<GetBlocklistSourcesUseCase>,
     pub create_blocklist_source: Arc<CreateBlocklistSourceUseCase>,
@@ -115,6 +119,7 @@ impl UseCases {
             get_queries: Arc::new(GetRecentQueriesUseCase::new(repos.query_log.clone())),
             get_timeline: Arc::new(GetTimelineUseCase::new(repos.query_log.clone())),
             get_query_rate: Arc::new(GetQueryRateUseCase::new(repos.query_log.clone())),
+            get_unique_domains: Arc::new(GetUniqueDomainsUseCase::new(repos.query_log.clone())),
             get_blocklist: Arc::new(GetBlocklistUseCase::new(repos.blocklist.clone())),
             get_block_filter_stats: Arc::new(GetBlockFilterStatsUseCase::new(
                 repos.block_filter_engine.clone(),
@@ -169,6 +174,11 @@ impl UseCases {
                 repos.client_subnet.clone(),
                 repos.block_filter_engine.clone(),
             )),
+            update_client_subnet: Arc::new(UpdateClientSubnetUseCase::new(
+                repos.client_subnet.clone(),
+                repos.group.clone(),
+                repos.block_filter_engine.clone(),
+            )),
             create_manual_client: Arc::new(CreateManualClientUseCase::new(
                 repos.client.clone(),
                 repos.group.clone(),
@@ -179,6 +189,7 @@ impl UseCases {
                 repos.group.clone(),
                 repos.block_filter_engine.clone(),
             )),
+            set_client_comment: Arc::new(SetClientCommentUseCase::new(repos.client.clone())),
             delete_client: Arc::new(DeleteClientUseCase::new(
                 repos.client.clone(),
                 repos.block_filter_engine.clone(),

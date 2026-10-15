@@ -5,7 +5,7 @@ use ferrous_dns_api_pihole::{
     },
     PiholeAppState,
 };
-use ferrous_dns_application::ports::BlockFilterEnginePort;
+use ferrous_dns_application::ports::{BlockFilterEnginePort, DnsCachePort};
 use ferrous_dns_application::use_cases::ReloadConfigUseCase;
 use ferrous_dns_domain::Config;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ pub fn build_pihole_state(
     use_cases: &UseCases,
     auth: &AuthServices,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
+    dns_cache: Arc<dyn DnsCachePort>,
     config: Arc<RwLock<Config>>,
     reload_config: Option<Arc<ReloadConfigUseCase>>,
     https_port: u16,
@@ -37,6 +38,8 @@ pub fn build_pihole_state(
             get_client_activity: use_cases.get_client_activity.clone(),
             get_query_log_storage: use_cases.get_query_log_storage.clone(),
             get_recent_queries: use_cases.get_queries.clone(),
+            get_query_rate: use_cases.get_query_rate.clone(),
+            get_unique_domains: use_cases.get_unique_domains.clone(),
         },
         blocking: PiholeBlockingState {
             block_filter_engine,
@@ -70,7 +73,12 @@ pub fn build_pihole_state(
             get_clients: use_cases.get_clients.clone(),
             create_manual_client: use_cases.create_manual_client.clone(),
             update_client: use_cases.update_client.clone(),
+            set_client_comment: use_cases.set_client_comment.clone(),
             delete_client: use_cases.delete_client.clone(),
+            get_client_subnets: use_cases.get_client_subnets.clone(),
+            create_client_subnet: use_cases.create_client_subnet.clone(),
+            update_client_subnet: use_cases.update_client_subnet.clone(),
+            delete_client_subnet: use_cases.delete_client_subnet.clone(),
         },
         system: PiholeSystemState {
             cleanup_query_logs: use_cases.cleanup_query_logs.clone(),
@@ -78,6 +86,7 @@ pub fn build_pihole_state(
             reload_config,
             process_start: std::time::Instant::now(),
             https_port,
+            dns_cache,
         },
         auth: PiholeAuthState {
             login: auth.use_cases.login.clone(),
@@ -86,6 +95,7 @@ pub fn build_pihole_state(
             logout: auth.use_cases.logout.clone(),
             validate_session: auth.use_cases.validate_session.clone(),
             get_mfa_status: auth.use_cases.get_mfa_status.clone(),
+            get_active_sessions: auth.use_cases.get_active_sessions.clone(),
         },
     }
 }

@@ -10,17 +10,22 @@ use ferrous_dns_api_pihole::state::{
     PiholeSystemState,
 };
 use ferrous_dns_api_pihole::{create_pihole_router_with_openapi, PiholeAppState};
-use ferrous_dns_application::ports::{BlockFilterEnginePort, FilterDecision};
+use ferrous_dns_application::ports::{
+    BlockFilterEnginePort, CacheEntryPage, CacheEntryQuery, CacheMetricsSnapshot, DnsCachePort,
+    FilterDecision,
+};
 use ferrous_dns_application::use_cases::{
-    CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
-    CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
-    CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
-    DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientActivityUseCase,
-    GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase, GetQueryLogStorageUseCase,
-    GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
+    CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateClientSubnetUseCase,
+    CreateGroupUseCase, CreateManagedDomainUseCase, CreateManualClientUseCase,
+    CreateRegexFilterUseCase, CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase,
+    DeleteClientSubnetUseCase, DeleteClientUseCase, DeleteGroupUseCase, DeleteManagedDomainUseCase,
+    DeleteRegexFilterUseCase, DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase,
+    GetClientActivityUseCase, GetClientSubnetsUseCase, GetClientsUseCase, GetGroupsUseCase,
+    GetManagedDomainsUseCase, GetQueryLogStorageUseCase, GetQueryRateUseCase, GetQueryStatsUseCase,
+    GetRecentQueriesUseCase, GetRegexFiltersUseCase, GetTimelineUseCase,
     GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase, GetTopBlockedDomainsUseCase,
-    GetTopClientsUseCase, GetWhitelistSourcesUseCase, UpdateBlocklistSourceUseCase,
+    GetTopClientsUseCase, GetUniqueDomainsUseCase, GetWhitelistSourcesUseCase,
+    SetClientCommentUseCase, UpdateBlocklistSourceUseCase, UpdateClientSubnetUseCase,
     UpdateClientUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
     UpdateWhitelistSourceUseCase,
 };
@@ -31,7 +36,9 @@ use ferrous_dns_domain::{
 };
 use ferrous_dns_infrastructure::repositories::{
     blocklist_source_repository::SqliteBlocklistSourceRepository,
-    client_repository::SqliteClientRepository, group_repository::SqliteGroupRepository,
+    client_repository::SqliteClientRepository,
+    client_subnet_repository::SqliteClientSubnetRepository,
+    group_repository::SqliteGroupRepository,
     managed_domain_repository::SqliteManagedDomainRepository,
     query_log_repository::SqliteQueryLogRepository,
     regex_filter_repository::SqliteRegexFilterRepository,
@@ -54,16 +61,72 @@ pub const MOCK_BLOCKLIST_ID: i64 = 1;
 pub const MOCK_GROUP_BLOCKLIST_ID: i64 = 2;
 pub const MOCK_DENY_REGEX_ID: i64 = 1;
 pub const MOCK_ALLOW_REGEX_ID: i64 = 2;
+/// The first allowlist created gets this id.
+pub const MOCK_ALLOWLIST_ID: i64 = 1;
 
 /// How long before the app was built the test process "started", so uptimes
 /// are large enough to tell seconds from milliseconds.
 pub const PROCESS_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What the stub DNS cache reports: insertions, evictions, and expired
+/// entries removed on access.
+pub const STUB_CACHE_INSERTIONS: u64 = 42;
+pub const STUB_CACHE_EVICTIONS: u64 = 7;
+pub const STUB_CACHE_EXPIRED: u64 = 3;
+
+/// A cache that holds nothing and reports the `STUB_CACHE_*` counters.
+struct StubDnsCache;
+
+impl DnsCachePort for StubDnsCache {
+    fn cache_size(&self) -> usize {
+        0
+    }
+
+    fn cache_metrics_snapshot(&self) -> CacheMetricsSnapshot {
+        CacheMetricsSnapshot {
+            insertions: STUB_CACHE_INSERTIONS,
+            evictions: STUB_CACHE_EVICTIONS,
+            lazy_deletions: STUB_CACHE_EXPIRED,
+            ..CacheMetricsSnapshot::default()
+        }
+    }
+
+    fn insert_permanent_record(
+        &self,
+        _domain: &str,
+        _record_type: ferrous_dns_domain::RecordType,
+        _addresses: Vec<IpAddr>,
+        _ttl: u32,
+    ) {
+    }
+
+    fn remove_record(&self, _domain: &str, _record_type: &ferrous_dns_domain::RecordType) -> bool {
+        false
+    }
+
+    fn is_permanent_record(
+        &self,
+        _domain: &str,
+        _record_type: &ferrous_dns_domain::RecordType,
+    ) -> bool {
+        false
+    }
+
+    fn list_entries(&self, _query: &CacheEntryQuery) -> CacheEntryPage {
+        CacheEntryPage {
+            entries: Vec::new(),
+            total: 0,
+            records_total: 0,
+        }
+    }
+}
+
 /// Domain decisions of the mock engine:
 /// - `regex.blocked.test` → blocked by the deny regex [`MOCK_DENY_REGEX_ID`]
 /// - `list.blocked.test` → blocked by the blocklist [`MOCK_BLOCKLIST_ID`]
 ///   and by the manual blocklist, which has no id
-/// - `allowlisted.test` → explicitly allowed by an allowlist (no id) and by
+/// - `allowlisted.test` → explicitly allowed by the allowlist
+///   [`MOCK_ALLOWLIST_ID`], by the manual allowlist, which has no id, and by
 ///   the allow regex [`MOCK_ALLOW_REGEX_ID`]
 /// - `group.blocked.test` → blocked by the blocklist
 ///   [`MOCK_GROUP_BLOCKLIST_ID`] in [`MOCK_CLIENT_GROUP`] only
@@ -129,6 +192,11 @@ impl BlockFilterEnginePort for MockBlockFilterEngine {
             ),
             "allowlisted.test" => (
                 vec![
+                    allow(
+                        AllowMatchKind::Allowlist,
+                        Some(MOCK_ALLOWLIST_ID),
+                        MatchType::Exact,
+                    ),
                     allow(AllowMatchKind::Allowlist, None, MatchType::Exact),
                     allow(
                         AllowMatchKind::Regex,
@@ -229,7 +297,8 @@ pub async fn create_test_db() -> sqlx::SqlitePool {
             last_hostname_update DATETIME,
             group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            comment TEXT
         )",
     )
     .execute(&pool)
@@ -315,7 +384,8 @@ pub async fn create_test_db() -> sqlx::SqlitePool {
             enabled     BOOLEAN NOT NULL DEFAULT 1,
             created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_synced_at TEXT
+            last_synced_at TEXT,
+            last_status INTEGER
         )",
     )
     .execute(&pool)
@@ -343,7 +413,8 @@ pub async fn create_test_db() -> sqlx::SqlitePool {
             enabled    BOOLEAN NOT NULL DEFAULT 1,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_synced_at TEXT
+            last_synced_at TEXT,
+            last_status INTEGER
         )",
     )
     .execute(&pool)
@@ -360,6 +431,13 @@ pub async fn create_test_db() -> sqlx::SqlitePool {
     .execute(&pool)
     .await
     .expect("Failed to create whitelist_source_groups table");
+
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/20260214000001_create_client_subnets.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Failed to create client_subnets table");
 
     pool
 }
@@ -380,6 +458,7 @@ async fn build_pihole_state(
 ) -> PiholeAppState {
     let db_config = DatabaseConfig::default();
     let client_repo = Arc::new(SqliteClientRepository::new(pool.clone(), &db_config));
+    let subnet_repo = Arc::new(SqliteClientSubnetRepository::new(pool.clone()));
     let query_log_repo = Arc::new(SqliteQueryLogRepository::new(
         pool.clone(),
         pool.clone(),
@@ -421,6 +500,8 @@ async fn build_pihole_state(
             get_client_activity: Arc::new(GetClientActivityUseCase::new(query_log_repo.clone())),
             get_query_log_storage: Arc::new(GetQueryLogStorageUseCase::new(query_log_repo.clone())),
             get_recent_queries: Arc::new(GetRecentQueriesUseCase::new(query_log_repo.clone())),
+            get_query_rate: Arc::new(GetQueryRateUseCase::new(query_log_repo.clone())),
+            get_unique_domains: Arc::new(GetUniqueDomainsUseCase::new(query_log_repo.clone())),
         },
         blocking: PiholeBlockingState {
             block_filter_engine: block_filter_engine.clone(),
@@ -515,8 +596,24 @@ async fn build_pihole_state(
                 group_repo.clone(),
                 block_filter_engine.clone(),
             )),
+            set_client_comment: Arc::new(SetClientCommentUseCase::new(client_repo.clone())),
             delete_client: Arc::new(DeleteClientUseCase::new(
                 client_repo,
+                block_filter_engine.clone(),
+            )),
+            get_client_subnets: Arc::new(GetClientSubnetsUseCase::new(subnet_repo.clone())),
+            create_client_subnet: Arc::new(CreateClientSubnetUseCase::new(
+                subnet_repo.clone(),
+                group_repo.clone(),
+                block_filter_engine.clone(),
+            )),
+            update_client_subnet: Arc::new(UpdateClientSubnetUseCase::new(
+                subnet_repo.clone(),
+                group_repo.clone(),
+                block_filter_engine.clone(),
+            )),
+            delete_client_subnet: Arc::new(DeleteClientSubnetUseCase::new(
+                subnet_repo,
                 block_filter_engine.clone(),
             )),
         },
@@ -528,6 +625,7 @@ async fn build_pihole_state(
                 .checked_sub(PROCESS_AGE)
                 .expect("monotonic clock is older than PROCESS_AGE"),
             https_port: 0,
+            dns_cache: Arc::new(StubDnsCache),
         },
         auth: auth::build_auth_state(totp_enrolled).await,
     }
@@ -547,6 +645,39 @@ pub async fn create_pihole_test_app_with_config(
     let state = build_pihole_state(pool, false, false).await;
     configure(&mut *state.system.config.write().await);
     create_pihole_router_with_openapi(state).0
+}
+
+/// Sends a body-less `method uri` to `app`, returning the status and the JSON
+/// body, or `Value::Null` when the body is empty or not JSON.
+pub async fn send(
+    app: Router,
+    method: &str,
+    uri: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("failed to build request"),
+        )
+        .await
+        .expect("request failed");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// The OpenAPI document served next to [`create_pihole_test_app`].

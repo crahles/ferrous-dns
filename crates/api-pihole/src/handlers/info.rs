@@ -1,14 +1,20 @@
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use axum::extract::State;
-use axum::Json;
-use ferrous_dns_domain::{DomainAction, DomainError};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderMap, Method, Version};
+use axum::response::Response;
+use axum::{Extension, Json};
+use ferrous_dns_domain::{Config, DomainAction, DomainError};
 
 use crate::{
+    crud::delete_reply,
     dto::info::{
-        AllowedDenied, ComponentVersion, DatabaseInfoResponse, DnsmasqMetrics, DockerVersion,
-        FtlClients, FtlComponentVersion, FtlDatabaseInfo, FtlInfo, FtlInfoResponse,
-        FtlLocalVersion, HostInfoResponse, LocalVersion, LoginInfoResponse, RemoteVersion,
+        AllowedDenied, CacheMetrics, ClientInfoResponse, ComponentVersion, CountResponse,
+        DatabaseInfoResponse, DhcpMetrics, DnsMetrics, DnsmasqMetrics, DockerVersion, FtlClients,
+        FtlComponentVersion, FtlDatabaseInfo, FtlInfo, FtlInfoResponse, FtlLocalVersion,
+        HostInfoResponse, HttpHeader, LocalVersion, LoginInfoResponse, MessagesResponse, Metrics,
+        MetricsResponse, RemoteVersion, ReplyMetrics, SensorsInfo, SensorsResponse,
         SystemInfoResponse, TotalEnabled, VersionComponents, VersionResponse,
     },
     errors::PiholeApiError,
@@ -37,6 +43,130 @@ pub async fn get_login_info(State(state): State<PiholeAppState>) -> Json<LoginIn
         dns: true,
         https_port: state.system.https_port,
     })
+}
+
+/// Pi-hole v6 GET /api/info/client
+///
+/// Public, as in FTL: the caller's address, HTTP version, method and
+/// headers, as the server received them.
+#[utoipa::path(
+    get,
+    path = "/info/client",
+    tag = "pihole:info",
+    responses(
+        (status = 200, description = "The request as received", body = ClientInfoResponse)
+    ),
+    security()
+)]
+pub async fn get_client_info(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    method: Method,
+    version: Version,
+    headers: HeaderMap,
+) -> Json<ClientInfoResponse> {
+    let remote_addr = connect_info.map_or(Ipv4Addr::UNSPECIFIED.into(), |info| info.0 .0.ip());
+    Json(ClientInfoResponse {
+        remote_addr: remote_addr.to_string(),
+        http_version: http_version(version).to_string(),
+        method: method.to_string(),
+        headers: headers
+            .iter()
+            .map(|(name, value)| HttpHeader {
+                name: name.to_string(),
+                value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// The version as CivetWeb reports it, without the `HTTP/` prefix.
+fn http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "1.1",
+    }
+}
+
+/// Pi-hole v6 GET /api/info/messages
+///
+/// FTL's diagnosis messages report dnsmasq and gravity warnings; Ferrous
+/// raises none, so the list is empty. A list that failed to download shows
+/// in the `status` of `/lists` instead.
+#[utoipa::path(
+    get,
+    path = "/info/messages",
+    tag = "pihole:info",
+    responses(
+        (status = 200, description = "Diagnosis messages, always none", body = MessagesResponse)
+    ),
+    security(("session_id" = []))
+)]
+pub async fn get_messages() -> Json<MessagesResponse> {
+    Json(MessagesResponse {
+        messages: Vec::new(),
+    })
+}
+
+/// Pi-hole v6 GET /api/info/sensors
+///
+/// Every hwmon chip with its temperatures, and the CPU's picked out, as FTL
+/// reads them from `/sys/class/hwmon`.
+#[utoipa::path(
+    get,
+    path = "/info/sensors",
+    tag = "pihole:info",
+    responses(
+        (status = 200, description = "Temperature sensors", body = SensorsResponse)
+    ),
+    security(("session_id" = []))
+)]
+pub async fn get_sensors() -> Result<Json<SensorsResponse>, PiholeApiError> {
+    let list = tokio::task::spawn_blocking(host::read_hwmon)
+        .await
+        .map_err(|e| DomainError::IoError(e.to_string()))?;
+    Ok(Json(SensorsResponse {
+        sensors: SensorsInfo {
+            cpu_temp: host::cpu_temp(&list),
+            list,
+            hot_limit: host::HOT_LIMIT,
+            unit: host::TEMPERATURE_UNIT,
+        },
+    }))
+}
+
+/// Pi-hole v6 GET /api/info/messages/count
+#[utoipa::path(
+    get,
+    path = "/info/messages/count",
+    tag = "pihole:info",
+    responses(
+        (status = 200, description = "Number of diagnosis messages, always 0", body = CountResponse)
+    ),
+    security(("session_id" = []))
+)]
+pub async fn get_messages_count() -> Json<CountResponse> {
+    Json(CountResponse { count: 0 })
+}
+
+/// Pi-hole v6 DELETE /api/info/messages/{ids}
+///
+/// There is never a message to delete, so this is FTL's 404 with `{}` for
+/// ids that name none.
+#[utoipa::path(
+    delete,
+    path = "/info/messages/{ids}",
+    tag = "pihole:info",
+    params(("ids" = String, Path, description = "Message id, or comma-separated ids")),
+    responses(
+        (status = 404, description = "No such message")
+    ),
+    security(("session_id" = []))
+)]
+pub async fn delete_messages(Path(_ids): Path<String>) -> Response {
+    delete_reply(0)
 }
 
 /// Pi-hole v6 GET /api/info/version
@@ -105,17 +235,19 @@ pub(crate) fn version_components() -> VersionComponents {
 pub async fn get_ftl_info(
     State(state): State<PiholeAppState>,
 ) -> Result<Json<FtlInfoResponse>, PiholeApiError> {
-    let (groups, blocklists, allowlists, domains, regexes, clients) = tokio::try_join!(
+    let (groups, blocklists, allowlists, domains, regexes, clients, query_frequency) = tokio::try_join!(
         state.groups.get_groups.get_all(),
         state.lists.get_blocklist_sources.get_all(),
         state.lists.get_whitelist_sources.get_all(),
         state.blocking.get_managed_domains.get_all(),
         state.blocking.get_regex_filters.get_all(),
         state.clients.get_clients.get_stats(),
+        super::stats::query_frequency(&state),
     )?;
-    let mem_percent = tokio::task::spawn_blocking(host::read_process_mem_percent)
-        .await
-        .map_err(|e| DomainError::IoError(e.to_string()))?;
+    let (mem_percent, cpu) =
+        tokio::task::spawn_blocking(|| (host::read_process_mem_percent(), host::cpu_usage()))
+            .await
+            .map_err(|e| DomainError::IoError(e.to_string()))?;
 
     Ok(Json(FtlInfoResponse {
         ftl: FtlInfo {
@@ -129,7 +261,7 @@ pub async fn get_ftl_info(
                 regex: count_by_action(regexes.iter().map(|r| (r.action, r.enabled))),
             },
             privacy_level: 0,
-            query_frequency: 0.0,
+            query_frequency,
             clients: FtlClients {
                 total: clients.total_clients,
                 active: clients.active_24h,
@@ -137,11 +269,67 @@ pub async fn get_ftl_info(
             pid: std::process::id(),
             uptime: state.system.process_start.elapsed().as_millis() as u64,
             mem_percent,
-            cpu_percent: 0.0,
+            cpu_percent: cpu.process,
             allow_destructive: true,
-            dnsmasq: DnsmasqMetrics::default(),
+            dnsmasq: dnsmasq_metrics(&state),
         },
     }))
+}
+
+/// The dnsmasq counters Ferrous's cache has an equivalent for: entries
+/// inserted, and live entries freed before their expiry.
+fn dnsmasq_metrics(state: &PiholeAppState) -> DnsmasqMetrics {
+    let cache = state.system.dns_cache.cache_metrics_snapshot();
+    DnsmasqMetrics {
+        dns_cache_inserted: cache.insertions,
+        dns_cache_live_freed: cache.evictions,
+        ..DnsmasqMetrics::default()
+    }
+}
+
+/// dnsmasq's `cache-size`: the configured capacity, 0 with the cache off.
+pub(crate) fn cache_capacity(config: &Config) -> u64 {
+    if config.dns.cache_enabled {
+        config.dns.cache_max_entries as u64
+    } else {
+        0
+    }
+}
+
+/// Pi-hole v6 GET /api/info/metrics
+///
+/// dnsmasq's cache and reply counters and its DHCP counters (info.c
+/// api_info_metrics). The cache figures come from Ferrous's cache; the
+/// per-type content, the reply counters and DHCP have no equivalent and stay
+/// empty or 0.
+#[utoipa::path(
+    get,
+    path = "/info/metrics",
+    tag = "pihole:info",
+    responses(
+        (status = 200, description = "Cache, reply and DHCP counters", body = MetricsResponse)
+    ),
+    security(("session_id" = []))
+)]
+pub async fn get_metrics(State(state): State<PiholeAppState>) -> Json<MetricsResponse> {
+    let size = cache_capacity(&*state.system.config.read().await);
+    let cache = state.system.dns_cache.cache_metrics_snapshot();
+    Json(MetricsResponse {
+        metrics: Metrics {
+            dns: DnsMetrics {
+                cache: CacheMetrics {
+                    size,
+                    inserted: cache.insertions,
+                    evicted: cache.evictions,
+                    expired: cache.lazy_deletions,
+                    immortal: 0,
+                    content: Vec::new(),
+                },
+                replies: ReplyMetrics::default(),
+            },
+            dhcp: DhcpMetrics::default(),
+        },
+    })
 }
 
 /// Tallies `(action, enabled)` pairs into FTL's allowed/denied totals.

@@ -3,12 +3,13 @@ use axum::response::{IntoResponse, Response};
 use axum::{http::StatusCode, Json};
 use chrono::{NaiveDateTime, Utc};
 use ferrous_dns_application::ports::TimeGranularity;
-use ferrous_dns_application::use_cases::PagedQueryInput;
+use ferrous_dns_application::use_cases::{PagedQueryInput, RateUnit};
 use ferrous_dns_domain::{DnsProtocol, DomainError, QueryStats};
 use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::{
+    crud::unix_seconds,
     dto::queries::{blocked_status, upstream_port},
     dto::stats::{
         ClientSummary, DatabaseSummaryResponse, DatabaseTopClientEntry, DatabaseTopClientsResponse,
@@ -22,6 +23,13 @@ use crate::{
 };
 
 pub const STATS_PERIOD_HOURS: f32 = 24.0;
+
+/// FTL's query `frequency`: queries per second, here over the last minute
+/// (FTL averages its last 30 seconds).
+pub(crate) async fn query_frequency(state: &PiholeAppState) -> Result<f64, DomainError> {
+    let rate = state.query.get_query_rate.execute(RateUnit::Minute).await?;
+    Ok(rate.queries as f64 / 60.0)
+}
 
 /// FTL's default for the `count` of `/stats/top_domains` and `/stats/top_clients`.
 const DEFAULT_TOP_COUNT: u32 = 10;
@@ -144,7 +152,14 @@ pub(crate) async fn summary(
     state: &PiholeAppState,
     period: f32,
 ) -> Result<SummaryResponse, DomainError> {
-    let stats = state.query.get_stats.execute(period).await?;
+    let (stats, blocklists, allowlists, clients, unique_domains, frequency) = tokio::try_join!(
+        state.query.get_stats.execute(period),
+        state.lists.get_blocklist_sources.get_all(),
+        state.lists.get_whitelist_sources.get_all(),
+        state.clients.get_clients.get_stats(),
+        state.query.get_unique_domains.execute(period),
+        query_frequency(state),
+    )?;
 
     let total = stats.queries_total;
     let blocked = stats.queries_blocked;
@@ -176,27 +191,36 @@ pub(crate) async fn summary(
     }
 
     let domains_being_blocked = state.blocking.block_filter_engine.compiled_domain_count() as u64;
+    // FTL reports when gravity last ran. Each list is stamped when it is
+    // downloaded, so the newest stamp is the last run that fetched one.
+    let last_update = blocklists
+        .iter()
+        .map(|list| list.last_synced_at.as_deref())
+        .chain(allowlists.iter().map(|list| list.last_synced_at.as_deref()))
+        .map(unix_seconds)
+        .max()
+        .unwrap_or(0);
 
     Ok(SummaryResponse {
         queries: QuerySummary {
             total,
             blocked,
             percent_blocked,
-            unique_domains: 0,
+            unique_domains,
             forwarded,
             cached: cache_hits + local_dns,
-            frequency: 0.0,
+            frequency,
             types,
             status,
             replies: ReplyTypeCounts::default(),
         },
         clients: ClientSummary {
             active: stats.unique_clients,
-            total: stats.unique_clients,
+            total: clients.total_clients,
         },
         gravity: GravitySummary {
             domains_being_blocked,
-            last_update: 0,
+            last_update,
         },
     })
 }

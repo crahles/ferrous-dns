@@ -239,6 +239,42 @@ pub struct Session {
     pub message: Option<String>,
 }
 
+/// `GET /auth/sessions` — auth.c:325-361 (get_all_sessions).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSessions {
+    pub sessions: Vec<SessionEntry>,
+    pub took: Option<f64>,
+}
+
+/// `sessions[]` — auth.c:334-355.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEntry {
+    pub id: i64,
+    pub current_session: bool,
+    pub valid: bool,
+    pub tls: SessionTls,
+    pub login_at: i64,
+    pub last_active: i64,
+    pub valid_until: i64,
+    pub remote_addr: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub user_agent: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub x_forwarded_for: Option<String>,
+    pub app: bool,
+    pub cli: bool,
+}
+
+/// `sessions[].tls` — auth.c:338-341.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTls {
+    pub login: bool,
+    pub mixed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // /info
 // ---------------------------------------------------------------------------
@@ -607,6 +643,223 @@ pub struct DatabaseOwnerGroup {
     pub gid: i64,
     // C (info.c api_info_database) emits null for `name` when getgrgid fails; YAML says string.
     pub name: Option<String>,
+}
+
+/// `GET /info/client` — info.c:63-88 (api_info_client).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoClient {
+    pub remote_addr: String,
+    pub http_version: String,
+    pub method: String,
+    pub headers: Vec<HttpHeader>,
+    pub took: Option<f64>,
+}
+
+/// `headers[]` — info.c:76-83.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// `GET /info/sensors` — info.c:770-780 (api_info_sensors).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoSensors {
+    pub sensors: Sensors,
+    pub took: Option<f64>,
+}
+
+/// `sensors` — info.c:698-768 (get_sensors_obj with the list).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sensors {
+    pub list: Vec<SensorChip>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub cpu_temp: Option<f64>,
+    pub hot_limit: f64,
+    pub unit: String,
+}
+
+/// `list[]` — info.c:441-452 (get_hwmon_sensors).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensorChip {
+    pub name: String,
+    pub path: String,
+    // C: JSON_COPY_STR_TO_OBJECT turns a missing symlink target into null.
+    #[serde(deserialize_with = "required_nullable")]
+    pub source: Option<String>,
+    pub temps: Vec<SensorTemp>,
+}
+
+/// `temps[]` — info.c:298-365 (read_hwmon_sensors).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensorTemp {
+    #[serde(deserialize_with = "required_nullable")]
+    pub name: Option<String>,
+    pub value: f64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub max: Option<f64>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub crit: Option<f64>,
+    pub sensor: String,
+}
+
+/// `GET /info/messages` — info.yaml:1145.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoMetrics {
+    pub metrics: Metrics,
+    pub took: Option<f64>,
+}
+
+/// `metrics` — info.c:1075-1150 (api_info_metrics).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    pub dns: MetricsDns,
+    pub dhcp: MetricsDhcp,
+}
+
+/// `metrics.dns` — info.c:1139-1141.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsDns {
+    pub cache: MetricsCache,
+    pub replies: MetricsReplies,
+}
+
+/// `metrics.dns.cache` — info.c:1079-1104.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsCache {
+    pub size: u64,
+    pub inserted: u64,
+    pub evicted: u64,
+    pub expired: u64,
+    pub immortal: u64,
+    pub content: Vec<MetricsCacheContent>,
+}
+
+/// `metrics.dns.cache.content[]` — info.c:1095-1102.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsCacheContent {
+    #[serde(rename = "type")]
+    pub rr_type: u64,
+    pub name: String,
+    pub count: MetricsCacheCount,
+}
+
+/// `content[].count` — info.c:1098-1101.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsCacheCount {
+    pub valid: u64,
+    pub stale: u64,
+}
+
+/// `metrics.dns.replies` — info.c:1106-1117.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsReplies {
+    pub local: u64,
+    pub forwarded: u64,
+    pub optimized: u64,
+    pub unanswered: u64,
+    pub auth: u64,
+    pub sum: u64,
+}
+
+/// `metrics.dhcp` — info.c:1119-1137.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsDhcp {
+    pub ack: u64,
+    pub decline: u64,
+    pub discover: u64,
+    pub inform: u64,
+    pub nak: u64,
+    pub offer: u64,
+    pub release: u64,
+    pub request: u64,
+    pub noanswer: u64,
+    pub bootp: u64,
+    pub pxe: u64,
+    pub leases: MetricsDhcpLeases,
+}
+
+/// `metrics.dhcp.leases` — info.c:1132-1137.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsDhcpLeases {
+    pub allocated_4: u64,
+    pub pruned_4: u64,
+    pub allocated_6: u64,
+    pub pruned_6: u64,
+}
+
+/// `GET /info/messages` — info.yaml:1145.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoMessages {
+    pub messages: Vec<InfoMessage>,
+    pub took: Option<f64>,
+}
+
+/// `messages[]` — info.yaml:1150.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoMessage {
+    pub id: i64,
+    pub timestamp: f64,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub plain: String,
+    pub html: String,
+}
+
+/// `GET /info/messages/count` — info.yaml:1298.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Count {
+    pub count: i64,
+    pub took: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// /dhcp
+// ---------------------------------------------------------------------------
+
+/// `GET /dhcp/leases` — dhcp.yaml:70.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpLeases {
+    pub leases: Vec<DhcpLease>,
+    pub took: Option<f64>,
+}
+
+/// `leases[]` — dhcp.yaml:77.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpLease {
+    pub expires: i64,
+    pub name: String,
+    pub hwaddr: String,
+    pub ip: String,
+    pub clientid: String,
+}
+
+/// An empty JSON object — FTL's body for a 404 without an error envelope
+/// (`DELETE /info/messages/{id}` naming no message).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Empty {
+    pub took: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1702,165 @@ pub struct PaddSensors {
     pub cpu_temp: Option<f64>,
     pub hot_limit: f64,
     pub unit: String,
+}
+
+// ---------------------------------------------------------------------------
+// /network
+// ---------------------------------------------------------------------------
+
+/// `GET /network/gateway` — network.c:35-118 (get_gateway, not detailed).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkGateway {
+    pub gateway: Vec<GatewayEntry>,
+    pub took: Option<f64>,
+}
+
+/// `gateway[]` — network.c:58-99.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayEntry {
+    pub family: String,
+    // C: JSON_COPY_STR_TO_OBJECT sends null for a route without one.
+    #[serde(deserialize_with = "required_nullable")]
+    pub interface: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub address: Option<String>,
+    pub local: Vec<String>,
+}
+
+/// `GET /network/routes` — network.c:131-145, netlink.c:179-446.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRoutes {
+    pub routes: Vec<Route>,
+    pub took: Option<f64>,
+}
+
+/// `routes[]` — netlink.c nlparsemsg_route without `detailed`: the first six
+/// keys and `dst` are always there, the rest only with their attribute.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    pub table: u32,
+    pub family: String,
+    pub protocol: String,
+    pub scope: String,
+    #[serde(rename = "type")]
+    pub route_type: String,
+    pub flags: Vec<String>,
+    pub dst: String,
+    pub src: Option<String>,
+    pub gateway: Option<String>,
+    pub prefsrc: Option<String>,
+    pub newdst: Option<String>,
+    pub via: Option<String>,
+    pub oif: Option<String>,
+    pub iif: Option<String>,
+    pub priority: Option<u32>,
+    pub pref: Option<u8>,
+}
+
+/// `GET /network/interfaces` — network.c:147-162, netlink.c nllinks + nladdrs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkInterfaces {
+    pub interfaces: Vec<NetworkInterface>,
+    pub took: Option<f64>,
+}
+
+/// `interfaces[]` — netlink.c:679-1330 (nlparsemsg_link, not detailed).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkInterface {
+    pub name: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub speed: Option<i64>,
+    #[serde(rename = "type")]
+    pub link_type: Option<String>,
+    pub flags: Vec<String>,
+    pub state: Option<String>,
+    pub carrier: Option<bool>,
+    pub proto_down: Option<bool>,
+    pub address: Option<String>,
+    pub broadcast: Option<String>,
+    pub perm_address: Option<String>,
+    pub stats: Option<InterfaceStats>,
+    pub addresses: Option<Vec<InterfaceAddress>>,
+}
+
+/// `interfaces[].stats` — netlink.c:950-974 (stats64; YAML lacks `bits`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceStats {
+    pub rx_bytes: PaddByteCount,
+    pub tx_bytes: PaddByteCount,
+    pub bits: u8,
+}
+
+/// `interfaces[].addresses[]` — netlink.c:448-677 (nlparsemsg_address).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceAddress {
+    pub family: String,
+    pub scope: String,
+    pub flags: Vec<String>,
+    pub prefixlen: u8,
+    pub address: Option<String>,
+    pub address_type: Option<String>,
+    pub local: Option<String>,
+    pub local_type: Option<String>,
+    pub broadcast: Option<String>,
+    pub broadcast_type: Option<String>,
+    pub anycast: Option<String>,
+    pub anycast_type: Option<String>,
+    pub label: Option<String>,
+    pub prefered: Option<u64>,
+    pub valid: Option<u64>,
+    pub cstamp: Option<f64>,
+    pub tstamp: Option<f64>,
+}
+
+/// `GET /network/devices` — network.c:165-281 (api_network_devices_GET).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDevices {
+    pub devices: Vec<NetworkDevice>,
+    pub took: Option<f64>,
+}
+
+/// `devices[]` — network.c:207-255.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDevice {
+    pub id: i64,
+    // C: JSON_COPY_STR_TO_OBJECT sends null for a missing value.
+    #[serde(deserialize_with = "required_nullable")]
+    pub hwaddr: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub interface: Option<String>,
+    #[serde(rename = "firstSeen")]
+    pub first_seen: i64,
+    #[serde(rename = "lastQuery")]
+    pub last_query: i64,
+    #[serde(rename = "numQueries")]
+    pub num_queries: i64,
+    #[serde(rename = "macVendor", deserialize_with = "required_nullable")]
+    pub mac_vendor: Option<String>,
+    pub ips: Vec<DeviceAddress>,
+}
+
+/// `devices[].ips[]` — network.c:226-231.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceAddress {
+    pub ip: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub name: Option<String>,
+    #[serde(rename = "lastSeen")]
+    pub last_seen: i64,
+    #[serde(rename = "nameUpdated")]
+    pub name_updated: i64,
 }
 
 // ---------------------------------------------------------------------------

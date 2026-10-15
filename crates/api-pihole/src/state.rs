@@ -1,19 +1,22 @@
-use ferrous_dns_application::ports::BlockFilterEnginePort;
+use ferrous_dns_application::ports::{BlockFilterEnginePort, DnsCachePort};
 use ferrous_dns_application::use_cases::{
-    AppPasswordLoginUseCase, GetClientActivityUseCase, GetMfaStatusUseCase,
-    GetQueryLogStorageUseCase, GetTopAllowedDomainsUseCase, GetTopBlockedClientsUseCase,
-    LoginUseCase, LogoutUseCase, ValidateSessionUseCase, VerifyMfaUseCase,
+    AppPasswordLoginUseCase, GetActiveSessionsUseCase, GetClientActivityUseCase,
+    GetMfaStatusUseCase, GetQueryLogStorageUseCase, GetTopAllowedDomainsUseCase,
+    GetTopBlockedClientsUseCase, LoginUseCase, LogoutUseCase, ValidateSessionUseCase,
+    VerifyMfaUseCase,
 };
 use ferrous_dns_application::use_cases::{
-    CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateGroupUseCase,
-    CreateManagedDomainUseCase, CreateManualClientUseCase, CreateRegexFilterUseCase,
-    CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase, DeleteClientUseCase,
-    DeleteGroupUseCase, DeleteManagedDomainUseCase, DeleteRegexFilterUseCase,
-    DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase, GetClientsUseCase, GetGroupsUseCase,
-    GetManagedDomainsUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase,
-    GetRegexFiltersUseCase, GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase,
-    GetWhitelistSourcesUseCase, ReloadConfigUseCase, UpdateBlocklistSourceUseCase,
-    UpdateClientUseCase, UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
+    CleanupOldQueryLogsUseCase, CreateBlocklistSourceUseCase, CreateClientSubnetUseCase,
+    CreateGroupUseCase, CreateManagedDomainUseCase, CreateManualClientUseCase,
+    CreateRegexFilterUseCase, CreateWhitelistSourceUseCase, DeleteBlocklistSourceUseCase,
+    DeleteClientSubnetUseCase, DeleteClientUseCase, DeleteGroupUseCase, DeleteManagedDomainUseCase,
+    DeleteRegexFilterUseCase, DeleteWhitelistSourceUseCase, GetBlocklistSourcesUseCase,
+    GetClientSubnetsUseCase, GetClientsUseCase, GetGroupsUseCase, GetManagedDomainsUseCase,
+    GetQueryRateUseCase, GetQueryStatsUseCase, GetRecentQueriesUseCase, GetRegexFiltersUseCase,
+    GetTimelineUseCase, GetTopBlockedDomainsUseCase, GetTopClientsUseCase, GetUniqueDomainsUseCase,
+    GetWhitelistSourcesUseCase, ReloadConfigUseCase, SetClientCommentUseCase,
+    UpdateBlocklistSourceUseCase, UpdateClientSubnetUseCase, UpdateClientUseCase,
+    UpdateGroupUseCase, UpdateManagedDomainUseCase, UpdateRegexFilterUseCase,
     UpdateWhitelistSourceUseCase,
 };
 use ferrous_dns_domain::Config;
@@ -49,6 +52,8 @@ pub struct PiholeAuthState {
     /// Whether the admin has TOTP enrolled, reported as `totp` in every
     /// session object.
     pub get_mfa_status: Arc<GetMfaStatusUseCase>,
+    /// The live sessions `/auth/sessions` lists.
+    pub get_active_sessions: Arc<GetActiveSessionsUseCase>,
 }
 
 impl PiholeAppState {
@@ -70,6 +75,10 @@ pub struct PiholeQueryState {
     pub get_client_activity: Arc<GetClientActivityUseCase>,
     pub get_query_log_storage: Arc<GetQueryLogStorageUseCase>,
     pub get_recent_queries: Arc<GetRecentQueriesUseCase>,
+    /// FTL's query `frequency`.
+    pub get_query_rate: Arc<GetQueryRateUseCase>,
+    /// FTL's `unique_domains`.
+    pub get_unique_domains: Arc<GetUniqueDomainsUseCase>,
 }
 
 #[derive(Clone)]
@@ -118,7 +127,13 @@ pub struct PiholeClientState {
     pub get_clients: Arc<GetClientsUseCase>,
     pub create_manual_client: Arc<CreateManualClientUseCase>,
     pub update_client: Arc<UpdateClientUseCase>,
+    pub set_client_comment: Arc<SetClientCommentUseCase>,
     pub delete_client: Arc<DeleteClientUseCase>,
+    /// Subnets are FTL's CIDR clients.
+    pub get_client_subnets: Arc<GetClientSubnetsUseCase>,
+    pub create_client_subnet: Arc<CreateClientSubnetUseCase>,
+    pub update_client_subnet: Arc<UpdateClientSubnetUseCase>,
+    pub delete_client_subnet: Arc<DeleteClientSubnetUseCase>,
 }
 
 #[derive(Clone)]
@@ -131,4 +146,6 @@ pub struct PiholeSystemState {
     /// Port the web server serves HTTPS on, or 0 for plain HTTP. Follows the
     /// TLS material that actually loaded, never `[server.web_tls] enabled`.
     pub https_port: u16,
+    /// The resolver's cache, for dnsmasq's cache counters.
+    pub dns_cache: Arc<dyn DnsCachePort>,
 }

@@ -10,6 +10,86 @@ pub struct LoginInfoResponse {
     pub https_port: u16,
 }
 
+/// Pi-hole v6 GET /api/info/client response: the request as the server
+/// received it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClientInfoResponse {
+    pub remote_addr: String,
+    pub http_version: String,
+    pub method: String,
+    pub headers: Vec<HttpHeader>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HttpHeader {
+    /// Lowercase: the HTTP stack normalises header names, FTL keeps their case.
+    pub name: String,
+    pub value: String,
+}
+
+/// Pi-hole v6 GET /api/info/messages response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorsResponse {
+    pub sensors: SensorsInfo,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorsInfo {
+    pub list: Vec<SensorChip>,
+    /// First temperature of the CPU sensor, null when none is found.
+    pub cpu_temp: Option<f64>,
+    /// FTL's default `webserver.api.temp.limit`; Ferrous has no such setting.
+    pub hot_limit: f64,
+    pub unit: &'static str,
+}
+
+/// One hwmon chip under `/sys/class/hwmon`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorChip {
+    /// The chip's `name` file, or its directory name without one.
+    pub name: String,
+    /// The `hwmonN` directory.
+    pub path: String,
+    /// The device the chip belongs to, null when the entry is not a link.
+    pub source: Option<String>,
+    pub temps: Vec<SensorTemp>,
+}
+
+/// A non-zero temperature input of a chip, in °C.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SensorTemp {
+    pub name: Option<String>,
+    pub value: f64,
+    pub max: Option<f64>,
+    pub crit: Option<f64>,
+    /// `tempN`.
+    pub sensor: String,
+}
+
+/// Pi-hole v6 GET /api/info/messages response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MessagesResponse {
+    pub messages: Vec<DiagnosisMessage>,
+}
+
+/// One of FTL's diagnosis messages (info.yaml). Ferrous raises none.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DiagnosisMessage {
+    pub id: i64,
+    /// Unix timestamp with fractional seconds.
+    pub timestamp: f64,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub plain: String,
+    pub html: String,
+}
+
+/// Pi-hole v6 GET /api/info/messages/count response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CountResponse {
+    pub count: u64,
+}
+
 /// Pi-hole v6 GET /api/info/version response.
 ///
 /// FTL reports Pi-hole's components (core, web, FTL, docker); Ferrous is a
@@ -131,7 +211,8 @@ pub struct FtlClients {
     pub active: u64,
 }
 
-/// dnsmasq's internal counters. Ferrous has no dnsmasq, so all are 0.
+/// dnsmasq's internal counters. Ferrous has no dnsmasq: only the cache
+/// counters have an equivalent, every other one is 0.
 #[derive(Debug, Default, Serialize, ToSchema)]
 pub struct DnsmasqMetrics {
     pub dns_cache_inserted: u64,
@@ -165,6 +246,90 @@ pub struct DnsmasqMetrics {
     /// Sic: FTL spells it this way.
     pub dhcp_lease_actve: u64,
     pub dhcp_lease_unknown: u64,
+}
+
+/// Pi-hole v6 GET /api/info/metrics response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MetricsResponse {
+    pub metrics: Metrics,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Metrics {
+    pub dns: DnsMetrics,
+    pub dhcp: DhcpMetrics,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DnsMetrics {
+    pub cache: CacheMetrics,
+    pub replies: ReplyMetrics,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CacheMetrics {
+    /// Configured cache capacity, 0 with the cache off.
+    pub size: u64,
+    /// Entries inserted since start.
+    pub inserted: u64,
+    /// Live entries removed before their expiry.
+    pub evicted: u64,
+    /// Expired entries removed when a lookup found them.
+    pub expired: u64,
+    /// Not counted by Ferrous, so 0.
+    pub immortal: u64,
+    /// Per-type counts; Ferrous does not keep them, so empty.
+    pub content: Vec<CacheContent>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CacheContent {
+    #[serde(rename = "type")]
+    pub rr_type: u16,
+    pub name: String,
+    pub count: CacheContentCount,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CacheContentCount {
+    pub valid: u64,
+    pub stale: u64,
+}
+
+/// dnsmasq's reply counters; Ferrous has no dnsmasq, so all are 0.
+#[derive(Debug, Default, Serialize, ToSchema)]
+pub struct ReplyMetrics {
+    pub local: u64,
+    pub forwarded: u64,
+    pub optimized: u64,
+    pub unanswered: u64,
+    pub auth: u64,
+    pub sum: u64,
+}
+
+/// dnsmasq's DHCP counters; Ferrous serves no DHCP, so all are 0.
+#[derive(Debug, Default, Serialize, ToSchema)]
+pub struct DhcpMetrics {
+    pub ack: u64,
+    pub decline: u64,
+    pub discover: u64,
+    pub inform: u64,
+    pub nak: u64,
+    pub offer: u64,
+    pub release: u64,
+    pub request: u64,
+    pub noanswer: u64,
+    pub bootp: u64,
+    pub pxe: u64,
+    pub leases: DhcpLeaseMetrics,
+}
+
+#[derive(Debug, Default, Serialize, ToSchema)]
+pub struct DhcpLeaseMetrics {
+    pub allocated_4: u64,
+    pub pruned_4: u64,
+    pub allocated_6: u64,
+    pub pruned_6: u64,
 }
 
 /// Pi-hole v6 GET /api/info/system response.

@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
+use axum::extract::OriginalUri;
+use axum::http::{Method, StatusCode};
+use axum::response::Response;
 use axum::{middleware, Extension, Router};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::{
-    handlers, middleware::require_pihole_auth, openapi::PiholeApiDoc, state::PiholeAppState,
+    errors::pihole_error_response, handlers, middleware::require_pihole_auth,
+    openapi::PiholeApiDoc, state::PiholeAppState,
 };
 
 /// Builds the Axum router for all Pi-hole v6 compatible endpoints together
@@ -28,7 +32,8 @@ pub fn create_pihole_router_with_openapi(
             handlers::auth::login,
             handlers::auth::logout
         ))
-        .routes(routes!(handlers::info::get_login_info));
+        .routes(routes!(handlers::info::get_login_info))
+        .routes(routes!(handlers::info::get_client_info));
 
     let protected_routes = OpenApiRouter::new()
         .routes(routes!(handlers::stats::get_summary))
@@ -121,11 +126,24 @@ pub fn create_pihole_router_with_openapi(
         .routes(routes!(handlers::info::get_system_info))
         .routes(routes!(handlers::info::get_host_info))
         .routes(routes!(handlers::info::get_database_info))
+        .routes(routes!(handlers::info::get_messages))
+        .routes(routes!(handlers::info::get_sensors))
+        .routes(routes!(handlers::info::get_metrics))
+        .routes(routes!(handlers::info::get_messages_count))
+        .routes(routes!(handlers::info::delete_messages))
+        .routes(routes!(handlers::dhcp::get_leases))
+        .routes(routes!(handlers::dhcp::delete_lease))
+        .routes(routes!(handlers::network::get_gateway))
+        .routes(routes!(handlers::network::get_routes))
+        .routes(routes!(handlers::network::get_interfaces))
+        .routes(routes!(handlers::network::get_devices))
         .routes(routes!(handlers::action::gravity))
         .routes(routes!(handlers::action::restartdns))
         .routes(routes!(handlers::action::flush_logs))
         .routes(routes!(handlers::padd::get_padd))
         .routes(routes!(handlers::endpoints::get_endpoints))
+        .routes(routes!(handlers::auth::list_sessions))
+        .routes(routes!(handlers::auth::delete_session))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_pihole_auth,
@@ -139,5 +157,31 @@ pub fn create_pihole_router_with_openapi(
 
     // `/endpoints` lists the finished document, so it is built only now.
     let endpoints = Arc::new(handlers::endpoints::list_endpoints(&openapi));
-    (router.layer(Extension(endpoints)), openapi)
+    let router = router
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(Extension(endpoints));
+    (router, openapi)
+}
+
+/// FTL's answer for a path it does not route (api.c), given before any
+/// authentication check, with the full request path as the hint.
+async fn not_found(OriginalUri(uri): OriginalUri) -> Response {
+    pihole_error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "Not found",
+        Some(uri.path()),
+    )
+}
+
+/// FTL's answer for a method a route does not take, with the method as the
+/// hint; axum still adds the Allow header.
+async fn method_not_allowed(method: Method) -> Response {
+    pihole_error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        "Method Not Allowed",
+        Some(method.as_str()),
+    )
 }

@@ -1,6 +1,6 @@
 use super::block_index::{
     AllowlistIndex, BlockIndex, RegexRule, SourceBitSet, SourceDescriptor, SourceMeta,
-    MANUAL_SOURCE_BIT,
+    MANUAL_SOURCE_BIT, MANUAL_SOURCE_BIT_INDEX, UNNAMED_ALLOW_BIT,
 };
 use super::download::ListDownloader;
 use super::suffix_trie::SuffixTrie;
@@ -9,7 +9,7 @@ use aho_corasick::AhoCorasick;
 use compact_str::CompactString;
 use dashmap::{DashMap, DashSet};
 use fancy_regex::Regex;
-use ferrous_dns_domain::{DomainAction, DomainError};
+use ferrous_dns_domain::{DomainAction, DomainError, ListSyncStatus};
 use futures::{stream, StreamExt};
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
@@ -234,8 +234,8 @@ fn build_group_masks(sources: &[SourceMeta], all_group_ids: &[i64]) -> HashMap<i
 
 /// Puts the text of every URL into `next`: the copy in `held`, unless `fetch`
 /// asks for a new download or no copy is held. A failed download keeps the
-/// held copy, so a flaky server cannot unblock a whole list. Returns the URLs
-/// downloaded by this call.
+/// held copy, so a flaky server cannot unblock a whole list. Returns how each
+/// download this call tried went; a reused copy is not tried.
 async fn fetch_lists(
     urls: HashSet<String>,
     downloader: &ListDownloader,
@@ -243,7 +243,7 @@ async fn fetch_lists(
     fetch: ListFetch,
     table: SourceTable,
     next: &mut HeldLists,
-) -> HashSet<String> {
+) -> HashMap<String, ListSyncStatus> {
     let mut to_download = Vec::new();
     for url in urls {
         match held.get(&url) {
@@ -264,22 +264,32 @@ async fn fetch_lists(
         .await;
 
     let kind = table.kind();
-    let mut downloaded = HashSet::new();
+    let mut outcomes = HashMap::new();
     for (url, result) in results {
-        match (result, held.get(&url)) {
+        let status = match (result, held.get(&url)) {
             (Ok(text), _) => {
                 info!(url = %url, "Fetched {kind} source");
+                let unchanged = held.get(&url).is_some_and(|old| old.as_ref() == text);
                 next.insert(url.clone(), Arc::from(text));
-                downloaded.insert(url);
+                if unchanged {
+                    ListSyncStatus::Unchanged
+                } else {
+                    ListSyncStatus::Updated
+                }
             }
             (Err(e), Some(text)) => {
                 warn!(url = %url, error = %e, "Failed to fetch {kind} source; keeping the previous download");
-                next.insert(url, Arc::clone(text));
+                next.insert(url.clone(), Arc::clone(text));
+                ListSyncStatus::FailedKeptCopy
             }
-            (Err(e), None) => warn!(url = %url, error = %e, "Failed to fetch {kind} source"),
-        }
+            (Err(e), None) => {
+                warn!(url = %url, error = %e, "Failed to fetch {kind} source");
+                ListSyncStatus::FailedNoCopy
+            }
+        };
+        outcomes.insert(url, status);
     }
-    downloaded
+    outcomes
 }
 
 /// Source table stamped by [`mark_sources_synced`]. An enum because the
@@ -334,6 +344,51 @@ pub async fn mark_sources_synced(
         .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
 
     Ok(())
+}
+
+/// Records how the last download went for each `(source id, status)`.
+async fn record_list_status(
+    pool: &SqlitePool,
+    table: SourceTable,
+    statuses: &[(i64, ListSyncStatus)],
+) -> Result<(), DomainError> {
+    let sql = format!("UPDATE {} SET last_status = ? WHERE id = ?", table.as_str());
+    for (id, status) in statuses {
+        sqlx::query(&sql)
+            .bind(status.code())
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Stamps the sources whose list downloaded and records every tried
+/// download's status. Failures are logged: a build still serves its lists.
+async fn record_downloads(
+    pool: &SqlitePool,
+    table: SourceTable,
+    statuses: Vec<(i64, ListSyncStatus)>,
+) {
+    // Only a download made now advances the timestamp; a reused or kept copy
+    // retains the previous one as a staleness signal.
+    let synced: Vec<i64> = statuses
+        .iter()
+        .filter(|(_, status)| status.downloaded())
+        .map(|(id, _)| *id)
+        .collect::<std::collections::BTreeSet<i64>>()
+        .into_iter()
+        .collect();
+    let kind = table.kind();
+    if let Err(e) =
+        mark_sources_synced(pool, table, &synced, &chrono::Utc::now().to_rfc3339()).await
+    {
+        warn!(error = %e, "Failed to record {kind} source sync timestamps");
+    }
+    if let Err(e) = record_list_status(pool, table, &statuses).await {
+        warn!(error = %e, "Failed to record {kind} source download status");
+    }
 }
 
 struct ManagedDomainEntry {
@@ -529,7 +584,7 @@ pub(super) async fn compile_block_index(
     } = load_sources(pool).await?;
     // Only lists still in use carry over, so a removed source releases its text.
     let mut next = HeldLists::new();
-    let downloaded = fetch_lists(
+    let outcomes = fetch_lists(
         url_tasks.iter().map(|(_, url)| url.clone()).collect(),
         downloader,
         held,
@@ -543,23 +598,14 @@ pub(super) async fn compile_block_index(
         .filter_map(|(bit, url)| next.get(url).map(|text| (*bit, Arc::clone(text))))
         .collect();
 
-    // Only a download made now advances the timestamp; a reused or kept copy
-    // retains the previous one as a staleness signal.
-    let synced_source_ids: Vec<i64> = url_tasks
+    let statuses = url_tasks
         .iter()
-        .filter(|(_, url)| downloaded.contains(url))
-        .filter_map(|(bit, _)| bit_to_source[*bit as usize].as_ref().map(|s| s.id))
+        .filter_map(|(bit, url)| {
+            let id = bit_to_source[*bit as usize].as_ref()?.id;
+            Some((id, *outcomes.get(url)?))
+        })
         .collect();
-    if let Err(e) = mark_sources_synced(
-        pool,
-        SourceTable::Blocklist,
-        &synced_source_ids,
-        &chrono::Utc::now().to_rfc3339(),
-    )
-    .await
-    {
-        warn!(error = %e, "Failed to record blocklist source sync timestamps");
-    }
+    record_downloads(pool, SourceTable::Blocklist, statuses).await;
 
     let manual_rows = sqlx::query("SELECT domain FROM blocklist")
         .fetch_all(pool)
@@ -672,9 +718,15 @@ pub(super) async fn compile_block_index(
     })
 }
 
+/// The `(source_id, group_id)` assignments that use one list.
+type ListAssignments = Vec<(i64, i64)>;
+
 struct AllowlistLoad {
     manual_rows: Vec<SqliteRow>,
-    sources: Vec<(Vec<i64>, Arc<str>)>,
+    /// Each downloaded list with the assignments that use it.
+    sources: Vec<(ListAssignments, Arc<str>)>,
+    /// Every enabled source with a list, by id.
+    names: Vec<(i64, String)>,
 }
 
 async fn load_allowlists(
@@ -689,7 +741,7 @@ async fn load_allowlists(
         .await
         .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
     let source_rows = sqlx::query(
-        "SELECT wsg.source_id, wsg.group_id, ws.url
+        "SELECT wsg.source_id, wsg.group_id, ws.url, ws.name
          FROM whitelist_source_groups wsg
          JOIN whitelist_sources ws ON ws.id = wsg.source_id
          WHERE ws.enabled = 1 AND ws.url IS NOT NULL",
@@ -698,19 +750,19 @@ async fn load_allowlists(
     .await
     .map_err(|e| DomainError::DatabaseError(e.to_string()))?;
 
-    // Fetch a URL once, retaining every group assignment and owning source id.
-    let mut urls: HashMap<String, (Vec<i64>, Vec<i64>)> = HashMap::new();
+    // Fetch a URL once, retaining every (source, group) assignment that uses it.
+    let mut urls: HashMap<String, ListAssignments> = HashMap::new();
+    let mut names: HashMap<i64, String> = HashMap::new();
     for row in source_rows {
         let url: String = row.get("url");
-        let (groups, source_ids) = urls.entry(url).or_default();
-        groups.push(row.get("group_id"));
         let source_id: i64 = row.get("source_id");
-        if !source_ids.contains(&source_id) {
-            source_ids.push(source_id);
-        }
+        urls.entry(url)
+            .or_default()
+            .push((source_id, row.get("group_id")));
+        names.insert(source_id, row.get("name"));
     }
 
-    let downloaded = fetch_lists(
+    let outcomes = fetch_lists(
         urls.keys().cloned().collect(),
         downloader,
         held,
@@ -719,28 +771,24 @@ async fn load_allowlists(
         next,
     )
     .await;
-    let synced_source_ids: Vec<i64> = urls
+    let statuses: Vec<(i64, ListSyncStatus)> = urls
         .iter()
-        .filter(|(url, _)| downloaded.contains(*url))
-        .flat_map(|(_, (_, ids))| ids.iter().copied())
+        .filter_map(|(url, assignments)| Some((assignments, *outcomes.get(url)?)))
+        .flat_map(|(assignments, status)| assignments.iter().map(move |(id, _)| (*id, status)))
+        .collect::<HashMap<i64, ListSyncStatus>>()
+        .into_iter()
         .collect();
-    if let Err(e) = mark_sources_synced(
-        pool,
-        SourceTable::Whitelist,
-        &synced_source_ids,
-        &chrono::Utc::now().to_rfc3339(),
-    )
-    .await
-    {
-        warn!(error = %e, "Failed to record allowlist source sync timestamps");
-    }
+    record_downloads(pool, SourceTable::Whitelist, statuses).await;
 
     Ok(AllowlistLoad {
         manual_rows,
         sources: urls
             .into_iter()
-            .filter_map(|(url, (groups, _))| next.get(&url).map(|text| (groups, Arc::clone(text))))
+            .filter_map(|(url, assignments)| {
+                next.get(&url).map(|text| (assignments, Arc::clone(text)))
+            })
             .collect(),
+        names: names.into_iter().collect(),
     })
 }
 
@@ -749,6 +797,21 @@ fn build_allowlist_index(
     managed_entries: &[ManagedDomainEntry],
 ) -> AllowlistIndex {
     let mut allowlists = AllowlistIndex::default();
+
+    // Sources get bits 0..=62 in id order; any past those share the unnamed bit.
+    let mut names = loaded.names;
+    names.sort_unstable_by_key(|(id, _)| *id);
+    let mut source_bit: HashMap<i64, SourceBitSet> = HashMap::with_capacity(names.len());
+    allowlists.bit_to_source = vec![None; 64];
+    for (idx, (id, name)) in names.into_iter().enumerate() {
+        if idx < MANUAL_SOURCE_BIT_INDEX {
+            source_bit.insert(id, 1u64 << idx);
+            allowlists.bit_to_source[idx] = Some(SourceDescriptor { id, name });
+        } else {
+            source_bit.insert(id, UNNAMED_ALLOW_BIT);
+        }
+    }
+
     for row in loaded.manual_rows {
         let domain = row.get::<String, _>("domain").to_ascii_lowercase();
         if domain.starts_with("*.") {
@@ -765,38 +828,51 @@ fn build_allowlist_index(
                     .group_wildcard
                     .entry(entry.group_id)
                     .or_default()
-                    .insert_wildcard(&entry.domain, 1u64);
+                    .insert_wildcard(&entry.domain, UNNAMED_ALLOW_BIT);
             }
             DomainAction::Allow => {
-                allowlists
-                    .group_exact
-                    .entry(entry.group_id)
-                    .or_insert_with(|| DashSet::with_hasher(FxBuildHasher))
-                    .insert(CompactString::new(&entry.domain));
+                insert_allow(
+                    &mut allowlists,
+                    entry.group_id,
+                    &entry.domain,
+                    UNNAMED_ALLOW_BIT,
+                );
             }
             DomainAction::Deny => {}
         }
     }
 
-    for (group_ids, text) in loaded.sources {
+    for (assignments, text) in loaded.sources {
         let entries = parse_list_text(&text);
-        for group_id in group_ids {
-            let exact_set = allowlists
-                .group_exact
-                .entry(group_id)
-                .or_insert_with(|| DashSet::with_hasher(FxBuildHasher));
-            let trie = allowlists.group_wildcard.entry(group_id).or_default();
+        // The sources that use this list in each group.
+        let mut group_bits: HashMap<i64, SourceBitSet> = HashMap::new();
+        for (source_id, group_id) in assignments {
+            let bit = source_bit
+                .get(&source_id)
+                .copied()
+                .unwrap_or(UNNAMED_ALLOW_BIT);
+            *group_bits.entry(group_id).or_default() |= bit;
+        }
+        for (group_id, bits) in group_bits {
             for entry in &entries {
                 match entry {
                     ParsedEntry::Exact(domain) => {
-                        exact_set.insert(CompactString::new(domain));
+                        insert_allow(&mut allowlists, group_id, domain, bits);
                     }
                     ParsedEntry::Wildcard(pattern) => {
-                        trie.insert_wildcard(pattern, 1u64);
+                        allowlists
+                            .group_wildcard
+                            .entry(group_id)
+                            .or_default()
+                            .insert_wildcard(pattern, bits);
                     }
                     ParsedEntry::DomainAndSubdomains(domain) => {
-                        exact_set.insert(CompactString::new(domain));
-                        trie.insert_wildcard(domain, 1u64);
+                        insert_allow(&mut allowlists, group_id, domain, bits);
+                        allowlists
+                            .group_wildcard
+                            .entry(group_id)
+                            .or_default()
+                            .insert_wildcard(domain, bits);
                     }
                     ParsedEntry::Pattern(_) => {}
                 }
@@ -804,4 +880,15 @@ fn build_allowlist_index(
         }
     }
     allowlists
+}
+
+/// Adds `bits` to the sources that allow `domain` exactly in `group_id`.
+fn insert_allow(allowlists: &mut AllowlistIndex, group_id: i64, domain: &str, bits: SourceBitSet) {
+    allowlists
+        .group_exact
+        .entry(group_id)
+        .or_insert_with(|| DashMap::with_hasher(FxBuildHasher))
+        .entry(CompactString::new(domain))
+        .and_modify(|existing| *existing |= bits)
+        .or_insert(bits);
 }
