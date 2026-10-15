@@ -1,5 +1,7 @@
 use super::health::HealthChecker;
+use super::health::HealthProbe;
 use super::query::{all_servers_failed, is_servfail};
+use super::routes::{PoolRoutes, Route, UpstreamRouter};
 use super::strategy::{QueryContext, ServerDisplays, Strategy, UpstreamResult};
 use crate::dns::forwarding::{HardeningOpts, MessageBuilder, ResponseParser, ResponseValidator};
 use crate::dns::transport::resolver::UpstreamHostResolver;
@@ -17,7 +19,11 @@ const MAX_ADDRS_PER_FAMILY: usize = 4;
 
 pub struct PoolManager {
     /// Live set of pools, swappable at runtime so upstream changes apply without a restart.
-    pools: ArcSwap<Vec<PoolWithStrategy>>,
+    pools: ArcSwap<PoolSet>,
+    /// Whether some pool is routed for a client group, so the cache's per-query
+    /// view lookup costs one atomic load for everyone who routes nothing per group.
+    /// Never false while the live set holds a group route.
+    has_group_routes: Arc<AtomicBool>,
     health_checker: Option<Arc<HealthChecker>>,
     /// Anti-spoofing hardening applied to upstream queries of every record type
     /// (DNS Cookies + 0x20).
@@ -41,6 +47,19 @@ struct PoolWithStrategy {
     server_groups: Vec<ServerGroup>,
     name_arc: Arc<str>,
     server_displays: ServerDisplays,
+    /// The zone a conditional pool's servers are health-checked with: they
+    /// may refuse any name outside their own domains.
+    probe_zone: Option<Arc<str>>,
+}
+
+/// The live pools and the routing built from them, swapped as one so a route
+/// never points into another set.
+struct PoolSet {
+    pools: Vec<PoolWithStrategy>,
+    routes: PoolRoutes,
+    /// Pools without domains, in priority order: the walk every name no
+    /// conditional pool answers takes.
+    default_pools: Vec<usize>,
 }
 
 /// Why a pool produced no answer.
@@ -97,7 +116,7 @@ impl PoolWithStrategy {
 
 /// An opaque, fully-rebuilt pool set produced by [`PoolManager::prepare`] and ready
 /// to be committed with [`PoolManager::apply`].
-pub struct PreparedPools(Vec<PoolWithStrategy>);
+pub struct PreparedPools(PoolSet);
 
 impl PoolManager {
     /// Looks upstream hostnames up with the system resolver only.
@@ -114,10 +133,11 @@ impl PoolManager {
         health_checker: Option<Arc<HealthChecker>>,
         host_resolver: UpstreamHostResolver,
     ) -> Result<Self, DomainError> {
-        let pools_with_strategy = Self::build_pools(pools, &host_resolver, false).await?;
+        let pool_set = Self::build_pools(pools, &host_resolver, false).await?;
 
         Ok(Self {
-            pools: ArcSwap::from_pointee(pools_with_strategy),
+            has_group_routes: Arc::new(AtomicBool::new(pool_set.routes.has_group_routes())),
+            pools: ArcSwap::from_pointee(pool_set),
             health_checker,
             hardening: HardeningOpts::default(),
             failing_open: AtomicBool::new(false),
@@ -159,16 +179,29 @@ impl PoolManager {
     /// Atomically swaps a previously [`prepared`](PoolManager::prepare) pool set into
     /// the live query path. Infallible — the fallible work happened in `prepare`.
     pub fn apply(&self, prepared: PreparedPools) {
+        let has_group_routes = prepared.0.routes.has_group_routes();
+        if has_group_routes {
+            self.has_group_routes.store(true, Ordering::Release);
+        }
         self.pools.store(Arc::new(prepared.0));
+        if !has_group_routes {
+            self.has_group_routes.store(false, Ordering::Release);
+        }
         info!(
             "Upstream pools reloaded ({} pools)",
-            self.pools.load().len()
+            self.pools.load().pools.len()
         );
+    }
+
+    /// Whether applying `prepared` would route some name differently than
+    /// the live set does.
+    pub fn routing_changes(&self, prepared: &PreparedPools) -> bool {
+        self.pools.load().routes.differs_from(&prepared.0.routes)
     }
 
     /// Whether some server has no address yet because its hostname lookup failed.
     pub fn has_unresolved(&self) -> bool {
-        Self::any_unresolved(&self.pools.load())
+        Self::any_unresolved(&self.pools.load().pools)
     }
 
     /// Looks every hostname up again while some server has none, by rebuilding
@@ -177,10 +210,10 @@ impl PoolManager {
     /// Returns whether a server is still unresolved.
     pub async fn retry_unresolved(&self) -> bool {
         let current = self.pools.load_full();
-        if !Self::any_unresolved(&current) {
+        if !Self::any_unresolved(&current.pools) {
             return false;
         }
-        let configs = current.iter().map(|p| p.config.clone()).collect();
+        let configs = current.pools.iter().map(|p| p.config.clone()).collect();
         let rebuilt = match Self::build_pools(configs, &self.host_resolver, true).await {
             Ok(rebuilt) => rebuilt,
             Err(e) => {
@@ -188,7 +221,7 @@ impl PoolManager {
                 return true;
             }
         };
-        let still_unresolved = Self::any_unresolved(&rebuilt);
+        let still_unresolved = Self::any_unresolved(&rebuilt.pools);
         let previous = self.pools.compare_and_swap(&current, Arc::new(rebuilt));
         if !Arc::ptr_eq(&*previous, &current) {
             return self.has_unresolved();
@@ -208,10 +241,15 @@ impl PoolManager {
         pools: Vec<UpstreamPool>,
         host_resolver: &UpstreamHostResolver,
         retry: bool,
-    ) -> Result<Vec<PoolWithStrategy>, DomainError> {
+    ) -> Result<PoolSet, DomainError> {
         if pools.is_empty() {
             return Err(DomainError::ConfigError(
                 "At least one pool must be configured".into(),
+            ));
+        }
+        if pools.iter().all(UpstreamPool::is_conditional) {
+            return Err(DomainError::ConfigError(
+                "At least one pool must have no domains, to answer every other query".into(),
             ));
         }
 
@@ -235,6 +273,7 @@ impl PoolManager {
                 .iter()
                 .map(|p| (Arc::clone(p), Arc::from(p.to_string())))
                 .collect();
+            let probe_zone = pool.normalized_domains()?.into_iter().next().map(Arc::from);
             pools_with_strategy.push(PoolWithStrategy {
                 config: pool,
                 strategy,
@@ -242,11 +281,25 @@ impl PoolManager {
                 server_groups,
                 name_arc,
                 server_displays,
+                probe_zone,
             });
         }
         pools_with_strategy.sort_by_key(|p| p.config.priority);
 
-        Ok(pools_with_strategy)
+        let configs: Vec<&UpstreamPool> = pools_with_strategy.iter().map(|p| &p.config).collect();
+        let routes = PoolRoutes::build(&configs)?;
+        let default_pools = configs
+            .iter()
+            .enumerate()
+            .filter(|(_, config)| !config.is_conditional())
+            .map(|(index, _)| index)
+            .collect();
+
+        Ok(PoolSet {
+            pools: pools_with_strategy,
+            routes,
+            default_pools,
+        })
     }
 
     async fn expand_hostnames(
@@ -386,6 +439,10 @@ impl PoolManager {
             .collect()
     }
 
+    /// Resolves `domain` as a client outside every group would: through a
+    /// conditional pool routed for every client, or else the default pools.
+    /// The DNSSEC chain walk uses this, so a routed zone's keys come from the
+    /// same resolvers as its answers.
     pub async fn query(
         &self,
         domain: &Arc<str>,
@@ -393,30 +450,114 @@ impl PoolManager {
         timeout_ms: u64,
         dnssec_ok: bool,
     ) -> Result<UpstreamResult, DomainError> {
+        self.query_for(None, domain, record_type, timeout_ms, dnssec_ok)
+            .await
+    }
+
+    /// Resolves `domain` through the conditional pool routed for it — for
+    /// `group`, else for every client — or else through the default pools
+    /// in priority order. A routed name is never asked anywhere else: when
+    /// its pool fails, the query fails.
+    pub async fn query_for(
+        &self,
+        group: Option<i64>,
+        domain: &Arc<str>,
+        record_type: &RecordType,
+        timeout_ms: u64,
+        dnssec_ok: bool,
+    ) -> Result<UpstreamResult, DomainError> {
         // Own the snapshot (load_full) rather than holding a Guard across the
         // upstream await — a long-lived Guard pins an arc_swap slot and slows reloads.
-        let pools = self.pools.load_full();
-        debug!(
-            total_pools = pools.len(),
-            %domain, "Starting load balancer query"
-        );
+        let set = self.pools.load_full();
+        let routed = set.routes.lookup(domain, group);
+        // An internal zone is unsigned: asking it for DNSSEC records only
+        // grows its answers.
+        let dnssec_ok = dnssec_ok && !routed.is_some_and(|(_, route)| route.internal);
 
         let (query_bytes, validator) =
             MessageBuilder::build_query_hardened(domain, record_type, dnssec_ok, self.hardening)?;
 
+        match routed {
+            Some((index, route)) => {
+                let mut result = self
+                    .query_routed(
+                        &set.pools[index],
+                        domain,
+                        timeout_ms,
+                        &query_bytes,
+                        &validator,
+                    )
+                    .await?;
+                result.internal = route.internal;
+                Ok(result)
+            }
+            None => {
+                self.query_default(&set, domain, timeout_ms, &query_bytes, &validator)
+                    .await
+            }
+        }
+    }
+
+    fn healthy_servers<'a>(
+        &self,
+        pool: &'a PoolWithStrategy,
+    ) -> SmallVec<[&'a Arc<DnsProtocol>; 16]> {
+        match &self.health_checker {
+            Some(checker) => pool
+                .server_protocols
+                .iter()
+                .filter(|p| checker.is_healthy(p))
+                .collect(),
+            None => pool.server_protocols.iter().collect(),
+        }
+    }
+
+    async fn query_routed(
+        &self,
+        pool: &PoolWithStrategy,
+        domain: &str,
+        timeout_ms: u64,
+        query_bytes: &[u8],
+        validator: &ResponseValidator,
+    ) -> Result<UpstreamResult, DomainError> {
+        debug!(pool = %pool.config.name, %domain, "Querying conditional pool");
+        let mut servers = self.healthy_servers(pool);
+        // Fail open within the pool, as the default walk does across pools.
+        if servers.is_empty() {
+            servers = pool.server_protocols.iter().collect();
+        }
+        if servers.is_empty() {
+            return Err(all_servers_failed(false));
+        }
+        match pool
+            .query(&servers, domain, timeout_ms, query_bytes, validator)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(PoolFailure::Final(e)) => Err(e),
+            Err(PoolFailure::FellThrough { servfail }) => Err(all_servers_failed(servfail)),
+        }
+    }
+
+    async fn query_default(
+        &self,
+        set: &PoolSet,
+        domain: &str,
+        timeout_ms: u64,
+        query_bytes: &[u8],
+        validator: &ResponseValidator,
+    ) -> Result<UpstreamResult, DomainError> {
+        debug!(
+            total_pools = set.default_pools.len(),
+            %domain, "Starting load balancer query"
+        );
+        let pools = || set.default_pools.iter().map(|&index| &set.pools[index]);
+
         let mut any_healthy = false;
         let mut any_tried = false;
         let mut all_servfail = true;
-        for pool in pools.iter() {
-            let healthy_refs: SmallVec<[&Arc<DnsProtocol>; 16]> =
-                if let Some(checker) = &self.health_checker {
-                    pool.server_protocols
-                        .iter()
-                        .filter(|p| checker.is_healthy(p))
-                        .collect()
-                } else {
-                    pool.server_protocols.iter().collect()
-                };
+        for pool in pools() {
+            let healthy_refs = self.healthy_servers(pool);
 
             if healthy_refs.is_empty() {
                 debug!(pool = %pool.config.name, "All unhealthy, skipping");
@@ -428,7 +569,7 @@ impl PoolManager {
             }
 
             match pool
-                .query(&healthy_refs, domain, timeout_ms, &query_bytes, &validator)
+                .query(&healthy_refs, domain, timeout_ms, query_bytes, validator)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -446,14 +587,14 @@ impl PoolManager {
             if !self.failing_open.swap(true, Ordering::Relaxed) {
                 warn!("No upstream server is marked healthy; querying all servers anyway");
             }
-            for pool in pools.iter() {
+            for pool in pools() {
                 let all_refs: SmallVec<[&Arc<DnsProtocol>; 16]> =
                     pool.server_protocols.iter().collect();
                 if all_refs.is_empty() {
                     continue;
                 }
                 match pool
-                    .query(&all_refs, domain, timeout_ms, &query_bytes, &validator)
+                    .query(&all_refs, domain, timeout_ms, query_bytes, validator)
                     .await
                 {
                     Ok(result) => return Ok(result),
@@ -480,6 +621,7 @@ impl PoolManager {
     pub fn get_all_servers(&self) -> Vec<std::net::SocketAddr> {
         self.pools
             .load()
+            .pools
             .iter()
             .flat_map(|p| p.server_protocols.iter().filter_map(|p| p.socket_addr()))
             .collect()
@@ -488,8 +630,24 @@ impl PoolManager {
     pub fn get_all_arc_protocols(&self) -> Vec<Arc<DnsProtocol>> {
         self.pools
             .load()
+            .pools
             .iter()
             .flat_map(|p| p.server_protocols.iter().cloned())
+            .collect()
+    }
+
+    /// Every server with the zone it is health-checked with: none for a
+    /// default pool's servers, the first routed domain for a conditional one's.
+    pub fn get_health_probes(&self) -> Vec<HealthProbe> {
+        self.pools
+            .load()
+            .pools
+            .iter()
+            .flat_map(|p| {
+                p.server_protocols
+                    .iter()
+                    .map(|protocol| (Arc::clone(protocol), p.probe_zone.clone()))
+            })
             .collect()
     }
 
@@ -498,6 +656,7 @@ impl PoolManager {
     pub fn get_pool_groups(&self) -> Vec<PoolGroupEntry> {
         self.pools
             .load()
+            .pools
             .iter()
             .flat_map(|p| {
                 let pool_name = Arc::clone(&p.name_arc);
@@ -510,6 +669,30 @@ impl PoolManager {
                 })
             })
             .collect()
+    }
+}
+
+impl UpstreamRouter for PoolManager {
+    fn route(&self, domain: &str, group: Option<i64>) -> Option<Route> {
+        self.pools
+            .load()
+            .routes
+            .lookup(domain, group)
+            .map(|(_, route)| route)
+    }
+
+    fn view(&self, domain: &str, group: Option<i64>) -> u32 {
+        if group.is_none() || !self.has_group_routes.load(Ordering::Acquire) {
+            return 0;
+        }
+        let set = self.pools.load();
+        set.routes
+            .lookup(domain, group)
+            .map_or(0, |(_, route)| route.view)
+    }
+
+    fn group_routes_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.has_group_routes)
     }
 }
 
