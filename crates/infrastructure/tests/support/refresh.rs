@@ -8,7 +8,7 @@ use ferrous_dns_domain::RecordType;
 use ferrous_dns_infrastructure::dns::cache::coarse_clock;
 use ferrous_dns_infrastructure::dns::{
     CachedAddresses, CachedData, ColdThresholds, DnsCache, DnsCacheConfig, DnsCacheMaintenance,
-    EvictionStrategy, RefreshRequest, RefreshSenders, ScheduledRefresh, TimerInbox,
+    EvictionStrategy, RefreshRequest, ScheduledRefresh, TimerInbox,
 };
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -23,7 +23,21 @@ pub fn refresh_cache(
     refresh_threshold: f64,
     access_window_secs: u64,
 ) -> Arc<DnsCache> {
-    Arc::new(DnsCache::new(DnsCacheConfig {
+    Arc::new(DnsCache::new(refresh_cache_config(
+        max_entries,
+        refresh_threshold,
+        access_window_secs,
+    )))
+}
+
+/// What [`refresh_cache`] builds from, for a test that changes a field:
+/// renewing ahead of expiry, with failed renewals retried after 300 s.
+pub fn refresh_cache_config(
+    max_entries: usize,
+    refresh_threshold: f64,
+    access_window_secs: u64,
+) -> DnsCacheConfig {
+    DnsCacheConfig {
         max_entries,
         eviction_strategy: EvictionStrategy::HitRate,
         refresh_threshold,
@@ -36,7 +50,9 @@ pub fn refresh_cache(
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
-    }))
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
+    }
 }
 
 pub fn address(ip: &str) -> CachedData {
@@ -65,46 +81,34 @@ pub struct Worker {
 }
 
 /// Wires `cache` to a new worker over `resolver`, as the cli wiring does,
-/// and keeps the coarse clock ticking. With `optimistic` off nothing arms a
-/// timer, and only serve-stale repairs reach the worker.
+/// and keeps the coarse clock ticking.
 pub fn start_worker(
     cache: &Arc<DnsCache>,
     resolver: Arc<dyn DnsResolver>,
     thresholds: ColdThresholds,
-    optimistic: bool,
 ) -> Worker {
     let _ticker = coarse_clock::start_clock_ticker();
     let (stale, stale_rx) = mpsc::channel(128);
-    let timers = Arc::new(TimerInbox::new(4_096));
-    let wired = optimistic.then(|| Arc::clone(&timers));
-    cache.set_refresh_senders(RefreshSenders {
-        stale: stale.clone(),
-        timers: wired.clone(),
-    });
+    cache.set_stale_repairs(stale.clone());
     DnsCacheMaintenance::start_refresh_worker(
         Arc::clone(cache),
         resolver,
         None,
         stale_rx,
-        wired,
         thresholds,
     );
-    Worker { stale, timers }
+    Worker {
+        stale,
+        timers: Arc::clone(cache.timer_inbox()),
+    }
 }
 
-/// Wires `cache` to an inbox and a repair queue the test reads in place of
-/// a worker. `capacity` bounds each inbox shard.
-pub fn wire_timers(
-    cache: &DnsCache,
-    capacity: usize,
-) -> (Arc<TimerInbox>, mpsc::Receiver<RefreshRequest>) {
+/// Wires `cache` to a repair queue the test reads in place of a worker, and
+/// hands back the cache's timer inbox, which the test drains in its place.
+pub fn wire_timers(cache: &DnsCache) -> (Arc<TimerInbox>, mpsc::Receiver<RefreshRequest>) {
     let (stale, stale_rx) = mpsc::channel(16);
-    let inbox = Arc::new(TimerInbox::new(capacity));
-    cache.set_refresh_senders(RefreshSenders {
-        stale,
-        timers: Some(Arc::clone(&inbox)),
-    });
-    (inbox, stale_rx)
+    cache.set_stale_repairs(stale);
+    (Arc::clone(cache.timer_inbox()), stale_rx)
 }
 
 /// Every timer armed since the last drain.

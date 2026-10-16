@@ -6,7 +6,7 @@ use crate::server::dns::connection_limiter::ConnectionLimiter;
 use crate::server::dns::MAX_UPSTREAM_BOUND_QUERIES;
 use ferrous_dns_application::drop_counter::DropCounter;
 use ferrous_dns_application::ports::{
-    CacheMaintenancePort, DgaEvictionTarget, DgaFlagStore, DnssecStatsPort, NxdomainHijackIpStore,
+    DgaEvictionTarget, DgaFlagStore, DnssecStatsPort, NxdomainHijackIpStore,
     NxdomainHijackProbeTarget, PtrRecordRegistry, ResponseIpFilterEvictionTarget,
     ResponseIpFilterStore, TunnelingEvictionTarget, TunnelingFlagStore, WildcardRecordRegistry,
 };
@@ -21,11 +21,10 @@ use ferrous_dns_infrastructure::dns::{
     dnssec::DnssecStatsAdapter,
     resolver::{LocalPtrResolver, LocalWildcardResolver, PtrRegistry, WildcardRegistry},
     ColdThresholds, DgaDetector, HealthChecker, NxdomainHijackDetector, PoolManager,
-    RefreshSenders, ResponseIpFilterDetector, TimerInbox, TunnelingDetector,
+    ResponseIpFilterDetector, TunnelingDetector,
 };
 use ferrous_dns_jobs::{
     DgaEvictionJob, NxdomainHijackEvictionJob, ResponseIpFilterEvictionJob, TunnelingEvictionJob,
-    MAINTENANCE_INTERVAL_SECS,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,9 +46,6 @@ pub struct DnsServices {
     /// whenever the cache is enabled. Kept so hot upstream reloads also reach it.
     pub maintenance_pool_manager: Option<Arc<PoolManager>>,
     pub health_checker: Arc<HealthChecker>,
-    /// Present whenever the cache is enabled; the optimistic scan runs only
-    /// with `cache_optimistic_refresh`, serve-stale repairs always.
-    pub cache_maintenance: Option<Arc<dyn CacheMaintenancePort>>,
     /// Live PTR map for local records. Always present, so a record added from
     /// the admin UI reverse-resolves without a restart.
     pub ptr_registry: Arc<dyn PtrRecordRegistry>,
@@ -122,7 +118,7 @@ impl DnsServices {
             );
         }
 
-        let (cache_maintenance, maintenance_pool_manager) = Self::setup_cache_maintenance(
+        let maintenance_pool_manager = Self::setup_cache_maintenance(
             config,
             &dns_cache,
             &health_checker,
@@ -356,7 +352,6 @@ impl DnsServices {
             dnssec_stats,
             maintenance_pool_manager,
             health_checker,
-            cache_maintenance,
             ptr_registry,
             wildcard_registry,
             local_dns_server,
@@ -366,6 +361,8 @@ impl DnsServices {
         })
     }
 
+    /// Starts the worker that renews, expires and evicts cache entries, and
+    /// returns the pool manager its renewals resolve through.
     async fn setup_cache_maintenance(
         config: &Config,
         cache: &Arc<DnsCache>,
@@ -373,39 +370,17 @@ impl DnsServices {
         upstream_layers: &resolver::UpstreamLayers,
         local_dns_server: Option<SocketAddr>,
         repos: &Repositories,
-    ) -> anyhow::Result<(
-        Option<Arc<dyn CacheMaintenancePort>>,
-        Option<Arc<PoolManager>>,
-    )> {
+    ) -> anyhow::Result<Option<Arc<PoolManager>>> {
         if !config.dns.cache_enabled {
-            return Ok((None, None));
+            return Ok(None);
         }
 
-        // Eviction and compaction run regardless: nothing else bounds the cache.
-        let maintenance = DnsCacheMaintenance::new(cache.clone(), MAINTENANCE_INTERVAL_SECS);
-
-        // The worker collects timers once a second, so each of the inbox's 16
-        // shards has to hold a second of the inserts and renewals the threads
-        // pushing to it make: anything past that is shed, and compaction arms
-        // the entry again. Sized off the cache, with a floor for small ones.
-        // A shard grows as it fills, so the bound (~10 MB of timers over all
-        // shards) is only reached under a burst that size.
-        let timers = config.dns.cache_optimistic_refresh.then(|| {
-            Arc::new(TimerInbox::new(
-                (config.dns.cache_max_entries / 4).clamp(4_096, 16_384),
-            ))
-        });
         // The stale queue is shallower on purpose: those items are
         // latency-sensitive and served first, so it only has to absorb a
         // burst, not a backlog — the client interaction is over long before a
         // deep one would drain.
         let (stale_tx, stale_rx) = tokio::sync::mpsc::channel(128);
-        cache.set_refresh_senders(RefreshSenders {
-            stale: stale_tx,
-            // Without it no entry arms a timer: nothing is renewed ahead of
-            // expiry, and serve-stale repairs still run.
-            timers: timers.clone(),
-        });
+        cache.set_stale_repairs(stale_tx);
 
         let thresholds = ColdThresholds {
             min_hit_rate: config.dns.cache_min_hit_rate,
@@ -420,20 +395,17 @@ impl DnsServices {
             .builder(Arc::clone(&maintenance_pool_manager))
             .build();
 
-        // Started even with optimistic refresh off: serve-stale repairs arrive on the stale queue.
+        // Started with optimistic refresh off too: every entry's expiry is a
+        // timer, and eviction and serve-stale repairs run on the same worker.
         DnsCacheMaintenance::start_refresh_worker(
             cache.clone(),
             resolver_for_maintenance,
             Some(repos.query_log.clone()),
             stale_rx,
-            timers,
             thresholds,
         );
 
-        Ok((
-            Some(Arc::new(maintenance) as Arc<dyn CacheMaintenancePort>),
-            Some(maintenance_pool_manager),
-        ))
+        Ok(Some(maintenance_pool_manager))
     }
 }
 
@@ -531,42 +503,86 @@ mod tests {
         );
     }
 
-    /// Nothing but the maintenance cycle bounds the positive cache, so turning
-    /// optimistic refresh off must not turn eviction off with it.
+    /// Polls `done` every 100 ms for up to `within`.
+    async fn wait_until(within: std::time::Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while !done() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        true
+    }
+
+    /// The cache is bounded as soon as it fills, by the running services alone,
+    /// with optimistic refresh on or off: no job has to come round first.
     #[tokio::test]
-    async fn cache_is_still_evicted_with_optimistic_refresh_off() {
+    async fn a_full_cache_is_evicted_without_a_job() {
         use ferrous_dns_domain::RecordType;
         use ferrous_dns_infrastructure::dns::CachedData;
+        use std::time::Duration;
 
         const MAX_ENTRIES: usize = 10;
-        let mut config = Config::default();
-        config.dns.cache_enabled = true;
-        config.dns.cache_optimistic_refresh = false;
-        config.dns.cache_max_entries = MAX_ENTRIES;
-        config.dns.cache_batch_eviction_percentage = 0.5;
-        let (_dir, services) = build_services(config).await;
+        for optimistic in [true, false] {
+            let mut config = Config::default();
+            config.dns.cache_enabled = true;
+            config.dns.cache_optimistic_refresh = optimistic;
+            config.dns.cache_max_entries = MAX_ENTRIES;
+            config.dns.cache_batch_eviction_percentage = 0.5;
+            let (_dir, services) = build_services(config).await;
 
-        for i in 0..MAX_ENTRIES * 2 {
-            services.cache.insert(
-                &format!("host{i}.example.com"),
-                RecordType::CNAME,
-                CachedData::CanonicalName(Arc::from("target.example.com")),
-                3600,
-                None,
+            for i in 0..MAX_ENTRIES * 2 {
+                services.cache.insert(
+                    &format!("host{i}.example.com"),
+                    RecordType::CNAME,
+                    CachedData::CanonicalName(Arc::from("target.example.com")),
+                    3600,
+                    None,
+                );
+            }
+            let before = services.cache.len();
+            assert!(before > MAX_ENTRIES);
+
+            let cache = Arc::clone(&services.cache);
+            assert!(
+                wait_until(Duration::from_secs(3), || cache.len() < before).await,
+                "an over-capacity cache was not evicted (optimistic refresh {optimistic})"
             );
         }
-        let before = services.cache.len();
-        assert!(before > MAX_ENTRIES);
+    }
 
-        let maintenance = services
-            .cache_maintenance
-            .expect("cache maintenance is wired whenever the cache is enabled");
-        maintenance.run_eviction_cycle().await.unwrap();
+    /// An entry past its serve-stale window leaves the cache by itself, with
+    /// optimistic refresh on or off: no job has to come round first.
+    #[tokio::test]
+    async fn a_dead_entry_leaves_the_cache_without_a_job() {
+        use ferrous_dns_domain::RecordType;
+        use ferrous_dns_infrastructure::dns::CachedData;
+        use std::time::Duration;
 
-        assert!(
-            services.cache.len() < before,
-            "eviction cycle removed nothing from an over-capacity cache"
-        );
+        for optimistic in [true, false] {
+            let mut config = Config::default();
+            config.dns.cache_enabled = true;
+            config.dns.cache_optimistic_refresh = optimistic;
+            config.dns.cache_min_ttl = 0;
+            let (_dir, services) = build_services(config).await;
+
+            // TTL 1: expired after 1 s, past the stale window after 2 s.
+            services.cache.insert(
+                "short-lived.example.com",
+                RecordType::CNAME,
+                CachedData::CanonicalName(Arc::from("target.example.com")),
+                1,
+                None,
+            );
+            assert_eq!(services.cache.len(), 1);
+
+            let cache = Arc::clone(&services.cache);
+            assert!(
+                wait_until(Duration::from_secs(10), || cache.is_empty()).await,
+                "a dead entry stayed in the cache (optimistic refresh {optimistic})"
+            );
+        }
     }
 
     /// Serve-stale repairs don't depend on the optimistic scan: with it off, a

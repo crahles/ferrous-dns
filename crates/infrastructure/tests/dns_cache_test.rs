@@ -24,6 +24,8 @@ fn create_refresh_cache(access_window_secs: u64) -> DnsCache {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     })
 }
 
@@ -59,6 +61,8 @@ fn create_cache(
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     })
 }
 
@@ -76,6 +80,8 @@ fn create_cache_with_ttl_limits(min_ttl: u32, max_ttl: u32) -> DnsCache {
         lfuk_k_value: 0.5,
         min_ttl,
         max_ttl,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     })
 }
 
@@ -426,6 +432,8 @@ fn test_lru_eviction_protects_recently_accessed_entry() {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     });
 
     // Inserir 3 entradas no tick T: last_access = T para todas
@@ -471,6 +479,8 @@ fn test_hit_rate_eviction_protects_high_hit_entries() {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     });
 
     cache.insert(
@@ -549,6 +559,8 @@ fn test_lfu_negative_score_below_min_frequency_leads_to_eviction() {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     });
 
     // Entradas com poucos hits (abaixo do min_frequency=5) têm score negativo
@@ -634,6 +646,8 @@ fn test_single_scan_evicts_exact_count() {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     });
 
     // Inserir max_entries entradas
@@ -776,110 +790,6 @@ fn test_lfuk_new_entries_evicted_in_order_not_urgently() {
     );
 }
 
-// ─── Testes de compaction ─────────────────────────────────────────────────────
-
-#[test]
-fn test_compact_removes_expired_entries_past_stale_window() {
-    let cache = create_refresh_cache(7200);
-    coarse_clock::tick();
-
-    cache.insert(
-        "expired.test",
-        RecordType::CNAME,
-        make_cname_data("alias"),
-        1,
-        None,
-    );
-
-    // TTL=1s, stale grace = 2×TTL = 2s → wait 3s to be fully past stale window
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    coarse_clock::tick();
-
-    let removed = cache.compact();
-    assert_eq!(
-        removed, 1,
-        "compact() deve remover entradas expiradas e fora da stale window"
-    );
-    assert_eq!(cache.len(), 0, "Cache deve estar vazio após compaction");
-}
-
-#[test]
-fn test_compact_retains_entries_within_stale_window() {
-    let cache = create_refresh_cache(7200);
-    coarse_clock::tick();
-
-    // TTL=3s, stale grace = 2×TTL = 6s → after 4s entry is expired but still stale-usable
-    cache.insert(
-        "stale.test",
-        RecordType::CNAME,
-        make_cname_data("alias"),
-        3,
-        None,
-    );
-
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    coarse_clock::tick();
-
-    let removed = cache.compact();
-    assert_eq!(
-        removed, 0,
-        "compact() não deve remover entradas ainda dentro da stale window"
-    );
-    assert_eq!(
-        cache.len(),
-        1,
-        "Entrada na stale window deve ser preservada"
-    );
-}
-
-#[test]
-fn test_compact_removes_marked_for_deletion() {
-    let cache = create_refresh_cache(7200);
-    coarse_clock::tick();
-
-    cache.insert(
-        "to-delete.test",
-        RecordType::CNAME,
-        make_cname_data("alias"),
-        1,
-        None,
-    );
-
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    coarse_clock::tick();
-
-    let result = cache.get(&Arc::from("to-delete.test"), &RecordType::CNAME);
-    assert!(
-        result.is_none(),
-        "get() deve retornar None para entrada expirada"
-    );
-
-    let removed = cache.compact();
-    assert_eq!(
-        removed, 1,
-        "compact() deve remover entradas marked_for_deletion"
-    );
-    assert_eq!(cache.len(), 0);
-}
-
-#[test]
-fn test_compact_retains_valid_entries() {
-    let cache = create_refresh_cache(7200);
-    coarse_clock::tick();
-
-    cache.insert(
-        "valid.test",
-        RecordType::A,
-        make_ip_data("1.1.1.1"),
-        3600,
-        None,
-    );
-
-    let removed = cache.compact();
-    assert_eq!(removed, 0, "Entradas válidas não devem ser removidas");
-    assert_eq!(cache.len(), 1);
-}
-
 // ─── Testes de eviction policies ─────────────────────────────────────────────
 
 /// Scores an entry that was inserted and last read at `now_secs`.
@@ -909,6 +819,8 @@ fn test_lru_evicts_least_recently_used() {
         lfuk_k_value: 0.5,
         min_ttl: 0,
         max_ttl: 86_400,
+        renew_ahead: true,
+        retry_lapsed_after_secs: 300,
     });
 
     coarse_clock::tick();
