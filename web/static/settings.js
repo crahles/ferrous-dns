@@ -173,7 +173,6 @@
                 nat64_prefix: '64:ff9b::/96'
             },
             cacheStats: {total_entries: 0, hit_rate: 0, total_hits: 0, total_misses: 0},
-            healthStatus: {},
             systemStatus: {
                 hostname: '',
             },
@@ -225,7 +224,7 @@
                 document.documentElement.classList.toggle('dark', this.theme === 'dark');
                 await checkAuth();
                 startRatePolling(rate => { this.queryRate = rate; });
-                await Promise.all([this.loadConfig(), this.loadDnsSettings(), this.loadHealthStatus(), this.loadCacheStats(), this.loadStats(), this.loadSystemStatus(), this.loadUsers(), this.loadApiTokens(), this.loadActiveSessions(), this.loadTlsStatus(), this.loadClientGroups()]);
+                await Promise.all([this.loadConfig(), this.loadDnsSettings(), this.loadCacheStats(), this.loadStats(), this.loadSystemStatus(), this.loadUsers(), this.loadApiTokens(), this.loadActiveSessions(), this.loadTlsStatus(), this.loadClientGroups()]);
                 scheduleLucide(100);
                 this.startPolling();
                 this._onVisibility = () => {
@@ -250,7 +249,6 @@
             startPolling() {
                 this.stopPolling();
                 this._pollId = setInterval(() => {
-                    this.loadHealthStatus();
                     this.loadStats();
                     this.loadSystemStatus();
                     if (this.restartRequired) this.refreshRestartRequired();
@@ -384,16 +382,6 @@
                     console.log('Using default DNS settings', e)
                 }
             },
-            async loadHealthStatus() {
-                this._ctrl.health?.abort();
-                this._ctrl.health = new AbortController();
-                try {
-                    const res = await apiFetch(`${API_BASE}/health/upstreams`, {signal: this._ctrl.health.signal});
-                    if (res.ok) this.healthStatus = await res.json()
-                } catch (e) {
-                    if (e.name !== 'AbortError') console.error('Load health error:', e)
-                }
-            },
             async loadCacheStats() {
                 try {
                     const res = await apiFetch(`${API_BASE}/cache/stats`);
@@ -412,9 +400,6 @@
                 } catch (e) {
                     console.error('Load client groups error:', e)
                 }
-            },
-            getServerHealth(s) {
-                return this.healthStatus[s] || 'Unknown'
             },
             addPool() {
                 this.config.dns.pools.push({name: '', strategy: 'parallel', priority: 1, servers: [''], domains: [], groups: [], internal: false});
@@ -900,29 +885,6 @@
             },
             kbToGb(kb) {
                 return (kb / 1048576).toFixed(1);
-            },
-            get groupedUpstreams() {
-                const pools = new Map();
-                for (const group of this.upstreamHealth) {
-                    const key = group.pool_name || 'default';
-                    if (!pools.has(key)) {
-                        pools.set(key, { pool_name: key, strategy: group.strategy || 'Parallel', servers: [] });
-                    }
-                    pools.get(key).servers.push(group);
-                }
-                return Array.from(pools.values());
-            },
-            strategyStyle(strategy) {
-                if (strategy === 'Parallel') return 'background:rgba(168,85,247,0.12);color:#A855F7';
-                if (strategy === 'Failover') return 'background:rgba(59,130,246,0.12);color:#3B82F6';
-                if (strategy === 'Balanced') return 'background:rgba(16,185,129,0.12);color:#10B981';
-                return 'background:var(--bg-tertiary);color:var(--text-secondary)';
-            },
-            poolStatusColor(status) {
-                if (status === 'Healthy')   return 'var(--color-success)';
-                if (status === 'Unhealthy') return 'var(--color-error)';
-                if (status === 'Partial')   return 'var(--color-warning)';
-                return 'var(--text-tertiary)';
             },
             toggleUpstream(addr) {
                 const idx = this.expandedUpstreams.indexOf(addr);
