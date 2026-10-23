@@ -85,6 +85,7 @@ impl CoreResolver {
                         cache_hit: false,
                         local_dns: true,
                         local_nxdomain: false,
+                        upstream_nxdomain: false,
                         dnssec_status: None,
                         cname_chain: Arc::clone(&EMPTY_CNAME_CHAIN),
                         upstream_server: Some(Arc::clone(display)),
@@ -157,6 +158,9 @@ impl DnsResolver for CoreResolver {
             .await?;
 
         let internal = result.internal;
+        // A reply with addresses is answered with them, as NOERROR.
+        let upstream_nxdomain =
+            result.response.is_nxdomain() && result.response.addresses.is_empty();
         let addresses = Arc::new(result.response.addresses);
         let upstream_server = Some(result.server_display);
         let cname_chain = result.response.cname_chain;
@@ -179,6 +183,7 @@ impl DnsResolver for CoreResolver {
             // server's: no DNSSEC validation, no rebinding protection.
             local_dns: internal,
             local_nxdomain: false,
+            upstream_nxdomain,
             dnssec_status: None,
             cname_chain: if cname_chain.is_empty() {
                 Arc::clone(&EMPTY_CNAME_CHAIN)
