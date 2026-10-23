@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use ferrous_dns_domain::{Config, DomainError, LocalDnsRecord};
+use ferrous_dns_domain::{Config, DnsProtocol, DomainError, LocalDnsRecord};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, instrument, warn};
 
 use crate::ports::{
     BlockFilterEnginePort, BlocklistSourceCreator, ConfigFilePersistence, GroupCreator,
-    LocalRecordCreator,
+    GroupRepository, LocalRecordCreator,
 };
 
 use super::snapshot::{BackupSnapshot, ImportSummary};
@@ -16,6 +17,14 @@ const SUPPORTED_VERSION: &str = "1";
 /// Pre-existing entities are expected on re-import and are skipped silently.
 fn is_duplicate_error(e: &DomainError) -> bool {
     matches!(e, DomainError::AlreadyExists(_))
+}
+
+/// The exporting server's group ids, keyed to the ids the same groups have
+/// here; `Err` carries the first id that has none.
+fn translate_group_ids(ids: &[i64], here: &HashMap<i64, i64>) -> Result<Vec<i64>, i64> {
+    ids.iter()
+        .map(|id| here.get(id).copied().ok_or(*id))
+        .collect()
 }
 
 /// The live config an import restores into, and the file it is saved to.
@@ -30,6 +39,7 @@ pub struct ConfigDestination {
 pub struct ImportConfigUseCase {
     destination: ConfigDestination,
     group_creator: Arc<dyn GroupCreator>,
+    group_repo: Arc<dyn GroupRepository>,
     blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
     local_record_creator: Arc<dyn LocalRecordCreator>,
     block_filter_engine: Arc<dyn BlockFilterEnginePort>,
@@ -39,6 +49,7 @@ impl ImportConfigUseCase {
     pub fn new(
         destination: ConfigDestination,
         group_creator: Arc<dyn GroupCreator>,
+        group_repo: Arc<dyn GroupRepository>,
         blocklist_source_creator: Arc<dyn BlocklistSourceCreator>,
         local_record_creator: Arc<dyn LocalRecordCreator>,
         block_filter_engine: Arc<dyn BlockFilterEnginePort>,
@@ -46,6 +57,7 @@ impl ImportConfigUseCase {
         Self {
             destination,
             group_creator,
+            group_repo,
             blocklist_source_creator,
             local_record_creator,
             block_filter_engine,
@@ -63,12 +75,22 @@ impl ImportConfigUseCase {
 
         let mut errors: Vec<String> = Vec::new();
 
-        let config_updated = self.apply_config(&snapshot, &mut errors).await;
-
+        // Groups first: pools and blocklist sources name them by id.
         let (groups_imported, groups_skipped) = self.import_groups(&snapshot, &mut errors).await;
+        let group_ids = self.map_group_ids(&snapshot).await?;
 
-        let (blocklist_sources_imported, blocklist_sources_skipped) =
-            self.import_blocklist_sources(&snapshot, &mut errors).await;
+        let (config_updated, restart_required) =
+            match self.apply_config(&snapshot, group_ids.as_ref()).await {
+                Ok(changed) => (true, changed),
+                Err(e) => {
+                    errors.push(e);
+                    (false, false)
+                }
+            };
+
+        let (blocklist_sources_imported, blocklist_sources_skipped) = self
+            .import_blocklist_sources(&snapshot, group_ids.as_ref(), &mut errors)
+            .await;
 
         // The creator above deliberately skips the per-source reload, so the
         // whole batch costs one block index rebuild instead of one each.
@@ -83,6 +105,7 @@ impl ImportConfigUseCase {
 
         info!(
             config_updated,
+            restart_required,
             groups_imported,
             groups_skipped,
             blocklist_sources_imported,
@@ -95,6 +118,7 @@ impl ImportConfigUseCase {
 
         Ok(ImportSummary {
             config_updated,
+            restart_required,
             groups_imported,
             groups_skipped,
             blocklist_sources_imported,
@@ -105,12 +129,53 @@ impl ImportConfigUseCase {
         })
     }
 
-    async fn apply_config(&self, snapshot: &BackupSnapshot, errors: &mut Vec<String>) -> bool {
+    /// Maps each backed-up group's id to the id it has here: its name's, or
+    /// for the default group, whatever this server calls it. `None` for an
+    /// older backup, whose groups carry no ids.
+    async fn map_group_ids(
+        &self,
+        snapshot: &BackupSnapshot,
+    ) -> Result<Option<HashMap<i64, i64>>, DomainError> {
+        if snapshot.data.groups.iter().all(|group| group.id.is_none()) {
+            return Ok(None);
+        }
+        let here = self.group_repo.get_all().await?;
+        let default_here = here
+            .iter()
+            .find(|group| group.is_default)
+            .and_then(|group| group.id);
+        let by_name: HashMap<&str, i64> = here
+            .iter()
+            .filter_map(|group| group.id.map(|id| (group.name.as_ref(), id)))
+            .collect();
+        Ok(Some(
+            snapshot
+                .data
+                .groups
+                .iter()
+                .filter_map(|group| {
+                    let id_here = if group.is_default {
+                        default_here
+                    } else {
+                        by_name.get(group.name.as_str()).copied()
+                    };
+                    group.id.zip(id_here)
+                })
+                .collect(),
+        ))
+    }
+
+    /// Restores the config section and returns whether it differs from the
+    /// config that was running; `Err` says why it was not restored.
+    async fn apply_config(
+        &self,
+        snapshot: &BackupSnapshot,
+        group_ids: Option<&HashMap<i64, i64>>,
+    ) -> Result<bool, String> {
         let Some(path) = &self.destination.path else {
             let msg = "No config file path available — config section not restored.";
             warn!(msg);
-            errors.push(msg.to_string());
-            return false;
+            return Err(msg.to_string());
         };
 
         // Merged and stored under the write guard: a writer that slipped in
@@ -122,13 +187,9 @@ impl ImportConfigUseCase {
         let sc = &snapshot.config;
         new_config.server.dns_port = sc.server.dns_port;
         new_config.server.web_port = sc.server.web_port;
-        match ferrous_dns_domain::config::server::parse_bind_host(&sc.server.bind_address) {
-            Ok(ip) => new_config.server.bind_address = ip,
-            Err(e) => {
-                errors.push(format!("Config section not restored: {e}"));
-                return false;
-            }
-        }
+        new_config.server.bind_address =
+            ferrous_dns_domain::config::server::parse_bind_host(&sc.server.bind_address)
+                .map_err(|e| format!("Config section not restored: {e}"))?;
         new_config.server.pihole_compat = sc.server.pihole_compat;
         new_config.server.web_tls.enabled = sc.server.tls_enabled;
         new_config.server.web_tls.tls_cert_path = sc.server.tls_cert_path.clone();
@@ -145,6 +206,13 @@ impl ImportConfigUseCase {
             } else {
                 ferrous_dns_domain::DnssecMode::Off
             });
+        }
+        // A backup always names the mode, while a config that never set it
+        // runs the default. When they agree, keep it written as it is here,
+        // so restoring the same settings changes nothing.
+        if new_config.dns.effective_dnssec_mode() == config.dns.effective_dnssec_mode() {
+            new_config.dns.dnssec_mode = config.dns.dnssec_mode;
+            new_config.dns.dnssec_enabled = config.dns.dnssec_enabled;
         }
         new_config.dns.cache_eviction_strategy = sc.dns.cache_eviction_strategy;
         new_config.dns.cache_max_entries = sc.dns.cache_max_entries;
@@ -163,6 +231,46 @@ impl ImportConfigUseCase {
         new_config.dns.mdns_enabled = sc.dns.mdns_enabled;
         new_config.dns.local_domain = sc.dns.local_domain.clone();
         new_config.dns.local_dns_server = sc.dns.local_dns_server.clone();
+        if let Some(pools) = &sc.dns.pools {
+            let no_groups = HashMap::new();
+            let mut restored = pools.clone();
+            for pool in &mut restored {
+                // Every backup that has pools lists its group ids, so a
+                // route's ids are always translated, never used as they are.
+                pool.groups = translate_group_ids(&pool.groups, group_ids.unwrap_or(&no_groups))
+                    .map_err(|id| {
+                        format!(
+                            "Config section not restored: pool '{}' is routed for client group {id}, which is not in the backup or could not be created here",
+                            pool.name
+                        )
+                    })?;
+                // `validate` does not parse servers; the resolver would fail
+                // on them at the next start.
+                if let Some(e) = pool
+                    .servers
+                    .iter()
+                    .find_map(|server| server.parse::<DnsProtocol>().err())
+                {
+                    return Err(format!(
+                        "Config section not restored: pool '{}': {e}",
+                        pool.name
+                    ));
+                }
+            }
+            new_config.dns.pools = restored;
+        }
+        if let Some(rate_limit) = &sc.dns.rate_limit {
+            new_config.dns.rate_limit = rate_limit.clone();
+        }
+        if let Some(malware) = &sc.dns.malware {
+            new_config.dns.malware_detection_enabled = malware.enabled;
+            new_config.dns.rebinding_protection_enabled = malware.rebinding_protection_enabled;
+            new_config.dns.rebinding_allowlist = malware.rebinding_allowlist.clone();
+            new_config.dns.tunneling_detection = malware.tunneling_detection.clone();
+            new_config.dns.dga_detection = malware.dga_detection.clone();
+            new_config.dns.nxdomain_hijack = malware.nxdomain_hijack.clone();
+            new_config.dns.response_ip_filter = malware.response_ip_filter.clone();
+        }
 
         new_config.blocking.enabled = sc.blocking.enabled;
         new_config.blocking.custom_blocked = sc.blocking.custom_blocked.clone();
@@ -187,10 +295,9 @@ impl ImportConfigUseCase {
         new_config.auth.webauthn.rp_id = sc.auth.webauthn_rp_id.clone();
         new_config.auth.webauthn.rp_origin = sc.auth.webauthn_rp_origin.clone();
 
-        if let Err(e) = new_config.validate() {
-            errors.push(format!("Config section not restored: {e}"));
-            return false;
-        }
+        new_config
+            .validate()
+            .map_err(|e| format!("Config section not restored: {e}"))?;
 
         match self
             .destination
@@ -198,14 +305,16 @@ impl ImportConfigUseCase {
             .save_config_to_file(&new_config, path)
         {
             Ok(_) => {
+                // Compared as the config handlers compare, pools included: a
+                // save applies pools live, an import applies nothing live.
+                let changed =
+                    serde_json::to_value(&*config).ok() != serde_json::to_value(&new_config).ok();
                 *config = new_config;
-                true
+                Ok(changed)
             }
             Err(e) => {
-                let msg = format!("Failed to persist config: {}", e);
                 error!(error = %e, "Config persistence failed during import");
-                errors.push(msg);
-                false
+                Err(format!("Failed to persist config: {}", e))
             }
         }
     }
@@ -242,18 +351,34 @@ impl ImportConfigUseCase {
     async fn import_blocklist_sources(
         &self,
         snapshot: &BackupSnapshot,
+        group_ids: Option<&HashMap<i64, i64>>,
         errors: &mut Vec<String>,
     ) -> (usize, usize) {
         let mut imported = 0usize;
         let mut skipped = 0usize;
 
         for source in &snapshot.data.blocklist_sources {
+            // An older backup's ids are used as they are, as they always were.
+            let source_group_ids = match group_ids {
+                Some(here) => match translate_group_ids(&source.group_ids, here) {
+                    Ok(ids) => ids,
+                    Err(id) => {
+                        skipped += 1;
+                        errors.push(format!(
+                            "Blocklist source '{}': client group {id} is not in the backup or could not be created here",
+                            source.name
+                        ));
+                        continue;
+                    }
+                },
+                None => source.group_ids.clone(),
+            };
             match self
                 .blocklist_source_creator
                 .create_blocklist_source(
                     source.name.clone(),
                     source.url.clone(),
-                    source.group_ids.clone(),
+                    source_group_ids,
                     source.comment.clone(),
                     source.enabled,
                 )
