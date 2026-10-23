@@ -117,9 +117,16 @@ docs: rewrite the contributor guide
 - Scope is the subsystem: `dns`, `dnssec`, `cache`, `auth`, `api`, `query-log`,
   `block-filter`, `docker`, `config`. Omit it only for repo-wide changes.
 - `build(deps): …` is reserved for Dependabot; `ci: …` is for workflow changes.
-- Marking a change breaking demands a CHANGELOG entry, a migration guide, and a
-  MAJOR bump — don't do it by accident.
-- `size/*` labels are applied automatically. Never set them by hand.
+- Marking a change breaking (a `BREAKING CHANGE` footer) demands a migration
+  guide and a major bump — minor while on 0.x — so don't do it by accident.
+  `CHANGELOG.md` is generated from the titles at release time; don't edit it in
+  your PR, describe the break and the migration in the PR body instead.
+- The title is also your changelog entry. PRs are squash-merged, and the
+  release notes list each one as `**scope:** description by @you in #N`.
+- Labels are applied for you: the kind of change from the title (`feat` →
+  `enhancement`, `fix` → `bug`, `docs` → `documentation`, `perf` →
+  `performance`, `refactor` → `refactor`), and the subject from the paths you
+  changed (`dns`, `cache`, `web`, … — see [`.github/labeler.yml`](.github/labeler.yml)).
 
 ### The body
 
@@ -238,7 +245,9 @@ list and the surfaces it deliberately does not cover.
 ## Documentation
 
 The site is [MkDocs](https://www.mkdocs.org/) — sources in `docs/`, nav in
-`mkdocs.yml`. `site/` is a build artifact; never edit it by hand.
+`mkdocs.yml`. `site/` is local build output and is gitignored. The published
+site is rebuilt from the release tag each time a release ships, so a docs change
+merged to `main` goes live with the next release.
 
 Dashboard screenshots live in `docs/assets/<area>/`, captured at a **1920x1080
 viewport in the light theme** so the set stays visually consistent. Give every
@@ -246,9 +255,32 @@ image descriptive alt text.
 
 ---
 
+## Releases
+
+A release goes through a pull request like everything else, so you can see what
+is about to ship:
+
+1. A maintainer runs the **Release PR** workflow (`patch`, `minor` or `major`).
+   It opens `chore(release): vX.Y.Z` with the version bump and the new section
+   of [`CHANGELOG.md`](CHANGELOG.md), which git-cliff builds from the titles of
+   the PRs merged since the last release.
+2. Every merge to `main` while it is open regenerates it for the same version,
+   so it always lists what the tag will contain. The notes get reviewed like
+   any other change; reword entries on that branch right before merging, since
+   a regeneration replaces them.
+3. Merging it tags the release. The tag builds the binaries and publishes the
+   GitHub release (with that `CHANGELOG.md` section as its notes), the Docker
+   image, and the documentation site.
+
+While on 0.x, a release with new features is still a patch bump unless
+something breaks. `make changelog` previews the notes of the next release.
+
+---
+
 ## Getting help
 
-- **Issues** — [github.com/ferrous-networking/ferrous-dns/issues](https://github.com/ferrous-networking/ferrous-dns/issues)
+- **Issues** — [github.com/ferrous-networking/ferrous-dns/issues](https://github.com/ferrous-networking/ferrous-dns/issues),
+  through the bug report or feature request form
 - **Discussions** — [github.com/ferrous-networking/ferrous-dns/discussions](https://github.com/ferrous-networking/ferrous-dns/discussions)
 - **Security** — do not open an issue; see [SECURITY.md](.github/SECURITY.md)
 
