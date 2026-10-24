@@ -202,6 +202,39 @@ mod tests {
     }
 
     #[test]
+    fn test_whitelisted_apex_keeps_phase_one_checks_on_subdomains() {
+        let guard = TunnelingGuard::from_config(&TunnelingDetectionConfig {
+            domain_whitelist: vec!["amazonaws.com".to_string()],
+            ..Default::default()
+        });
+        for (domain, record_type, expected_signal) in [
+            (
+                format!("{}.amazonaws.com", "a".repeat(51)),
+                RecordType::A,
+                "label_length",
+            ),
+            (
+                format!("{}amazonaws.com", "a.".repeat(60)),
+                RecordType::A,
+                "fqdn_length",
+            ),
+            (
+                "ce.us-east-1.amazonaws.com".to_string(),
+                RecordType::NULL,
+                "null_record_type",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    guard.check(&domain, record_type, TEST_IP),
+                    TunnelingVerdict::Detected { signal, .. } if signal == expected_signal
+                ),
+                "{domain}: expected {expected_signal}"
+            );
+        }
+    }
+
+    #[test]
     fn whitelisted_client_passes_check() {
         let guard = TunnelingGuard::from_config(&TunnelingDetectionConfig {
             enabled: true,

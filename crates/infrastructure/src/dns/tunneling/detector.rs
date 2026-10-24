@@ -245,6 +245,6 @@ impl TunnelingEvictionTarget for TunnelingDetector {
 impl TunnelingFlagStore for TunnelingDetector {
     fn is_flagged(&self, domain: &str) -> bool {
         let apex = extract_apex(domain);
-        !self.is_domain_whitelisted(domain, apex) && self.flagged_domains.contains_key(apex)
+        self.flagged_domains.contains_key(apex) && !self.is_domain_whitelisted(domain, apex)
     }
 }

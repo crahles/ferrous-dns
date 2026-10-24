@@ -510,6 +510,12 @@ client_whitelist             = []
 | `domain_whitelist` | `list` | `[]` | Case-insensitive exact names exempt from tunneling detection. Apex entries also exempt their namespace from phase-2 statistics and flags; phase-1 checks still apply to subdomains. Wildcards and trailing dots are rejected |
 | `client_whitelist` | `list` | `[]` | Client CIDRs or bare IPs exempt from tunneling detection |
 
+An apex means the last two labels, or three under a suffix in Ferrous's built-in
+compound-suffix list, such as `co.uk`. This does not use the Public Suffix List;
+below other multi-label suffixes, whitelist entries match exact names only.
+Only exempt namespaces whose DNS control you trust, including delegations; see
+[Whitelisting](../features/malware-detection.md#whitelisting).
+
 See [Malware Detection](../features/malware-detection.md#dns-tunneling-detection).
 
 ---
