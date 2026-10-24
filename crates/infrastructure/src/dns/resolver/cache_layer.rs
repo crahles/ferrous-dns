@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ferrous_dns_application::ports::{DnsResolution, DnsResolver, EMPTY_CNAME_CHAIN};
-use ferrous_dns_domain::{DnsQuery, DnssecStatus, DomainError, RecordType};
+use ferrous_dns_domain::{CoalescedRole, DnsQuery, DnssecStatus, DomainError, RecordType};
 use rustc_hash::FxBuildHasher;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,28 +18,35 @@ use tokio::sync::watch;
 
 static EMPTY_ADDRESSES: LazyLock<Arc<Vec<IpAddr>>> = LazyLock::new(|| Arc::new(vec![]));
 
+/// What a leader got, handed to the queries that joined it.
 struct InflightResult {
     addresses: Arc<Vec<IpAddr>>,
+    cache_hit: bool,
     local_dns: bool,
     upstream_nxdomain: bool,
     cname_chain: Arc<[Arc<str>]>,
     dnssec_status: Option<DnssecStatus>,
+    upstream_server: Option<Arc<str>>,
+    upstream_pool: Option<Arc<str>>,
     min_ttl: Option<u32>,
     upstream_wire_data: Option<Bytes>,
 }
 
 impl InflightResult {
+    /// A follower got its leader's answer: from the upstream, or from the
+    /// cache when the leader found it there.
     fn to_resolution(&self) -> DnsResolution {
         DnsResolution {
             addresses: Arc::clone(&self.addresses),
-            cache_hit: true,
+            cache_hit: self.cache_hit,
             local_dns: self.local_dns,
             local_nxdomain: false,
             upstream_nxdomain: self.upstream_nxdomain,
+            coalesced: Some(CoalescedRole::Follower),
             dnssec_status: self.dnssec_status,
             cname_chain: Arc::clone(&self.cname_chain),
-            upstream_server: None,
-            upstream_pool: None,
+            upstream_server: self.upstream_server.clone(),
+            upstream_pool: self.upstream_pool.clone(),
             min_ttl: self.min_ttl,
             negative_soa_ttl: None,
             upstream_wire_data: self.upstream_wire_data.clone(),
@@ -183,6 +190,7 @@ impl CachedResolver {
             upstream_nxdomain: upstream_wire_data
                 .as_deref()
                 .is_some_and(wire_response::is_nxdomain),
+            coalesced: None,
             dnssec_status: dnssec_status.and_then(CachedDnssecStatus::to_domain),
             cname_chain,
             upstream_server: None,
@@ -348,17 +356,17 @@ impl CachedResolver {
 
         // Another leader may have filled the cache between our election and
         // now; serve that and hand it to our followers instead of going upstream.
-        if let Some(cached) =
+        if let Some(mut cached) =
             self.check_cache_str(query.domain.as_ref(), query.record_type, guard.key.view)
         {
-            self.publish_inflight(&guard.key, &cached);
+            self.publish_inflight(&guard.key, &mut cached);
             guard.defuse();
             return Self::cached_outcome(cached);
         }
 
-        let result = self.inner.resolve(query).await;
+        let mut result = self.inner.resolve(query).await;
 
-        match &result {
+        match &mut result {
             Ok(resolution) => {
                 self.store_in_cache(query, &guard.key, routed, resolution);
                 self.publish_inflight(&guard.key, resolution);
@@ -391,8 +399,9 @@ impl CachedResolver {
 
     /// Removes the in-flight entry for `key` and publishes `resolution` to its
     /// followers. A resolution without response data is published as `None`,
-    /// which followers turn into their own cache check or resolution.
-    fn publish_inflight(&self, key: &CacheKey, resolution: &DnsResolution) {
+    /// which followers turn into their own cache check or resolution. A
+    /// resolution some follower got is marked as the leader's.
+    fn publish_inflight(&self, key: &CacheKey, resolution: &mut DnsResolution) {
         let Some((_, tx)) = self.inflight.remove(key) else {
             return;
         };
@@ -402,14 +411,23 @@ impl CachedResolver {
         }
         let inflight = Arc::new(InflightResult {
             addresses: Arc::clone(&resolution.addresses),
+            cache_hit: resolution.cache_hit,
             local_dns: resolution.local_dns,
             upstream_nxdomain: resolution.upstream_nxdomain,
             cname_chain: Arc::clone(&resolution.cname_chain),
             dnssec_status: resolution.dnssec_status,
+            upstream_server: resolution.upstream_server.clone(),
+            upstream_pool: resolution.upstream_pool.clone(),
             min_ttl: resolution.min_ttl,
             upstream_wire_data: resolution.upstream_wire_data.clone(),
         });
-        let _ = tx.send(Some(inflight));
+        // The leader dropped its own receiver, so every one left is a follower.
+        if tx
+            .send(Some(inflight))
+            .is_ok_and(|()| tx.receiver_count() > 0)
+        {
+            resolution.coalesced = Some(CoalescedRole::Leader);
+        }
     }
 }
 
@@ -441,6 +459,9 @@ impl DnsResolver for CachedResolver {
         if !is_leader {
             return self.resolve_as_follower(query, rx).await;
         }
+        // Only followers keep a receiver, so the receivers left at publish
+        // count them.
+        drop(rx);
         self.resolve_as_leader(query, key, route.is_some()).await
     }
 }

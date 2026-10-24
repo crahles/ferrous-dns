@@ -69,6 +69,8 @@ Client C ─┘
 
 This eliminates thundering-herd on popular domains under high load.
 
+Each waiter is logged with the answer the leader got: an upstream answer, with the leader's server, or a cache hit when the leader found the answer already cached. Its response time is its own wait, so a wait for the upstream never counts toward Cache Hits or Cache Time. The Query Log marks the leader and every waiter with a merge icon.
+
 ---
 
 ## Upstream Load Balancing
