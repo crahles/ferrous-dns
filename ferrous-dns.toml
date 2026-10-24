@@ -179,7 +179,7 @@ txt_proportion_threshold = 0.05         # Phase 2: TXT > 5% of client traffic
 nxdomain_ratio_threshold = 0.20         # Phase 2: NXDOMAIN > 20% for a client+apex pair
 confidence_threshold = 0.7              # Phase 2: minimum score to flag (0.0-1.0)
 stale_entry_ttl_secs = 300              # Eviction of idle tracking entries (seconds)
-domain_whitelist = []                   # Domains exempt from detection
+domain_whitelist = []                   # Exact names exempt; apex entries also skip phase-2 analysis for their namespace
 client_whitelist = []                   # Client CIDRs or IPs exempt from detection
 
 

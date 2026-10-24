@@ -507,7 +507,7 @@ client_whitelist             = []
 | `nxdomain_ratio_threshold` | `float` | `0.20` | Phase 2: NXDOMAIN ratio above 20% triggers a flag. Above 0, at most 1 |
 | `confidence_threshold` | `float` | `0.7` | Phase 2: minimum combined confidence score required to act. Above 0, at most 1 |
 | `stale_entry_ttl_secs` | `int` | `300` | Seconds of inactivity before a tracking entry is evicted. At least 1 |
-| `domain_whitelist` | `list` | `[]` | Exact domain names exempt from tunneling detection; wildcards and trailing dots never match and are rejected |
+| `domain_whitelist` | `list` | `[]` | Case-insensitive exact names exempt from tunneling detection. Apex entries also exempt their namespace from phase-2 statistics and flags; phase-1 checks still apply to subdomains. Wildcards and trailing dots are rejected |
 | `client_whitelist` | `list` | `[]` | Client CIDRs or bare IPs exempt from tunneling detection |
 
 See [Malware Detection](../features/malware-detection.md#dns-tunneling-detection).

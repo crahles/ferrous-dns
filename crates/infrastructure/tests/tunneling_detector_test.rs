@@ -320,3 +320,69 @@ async fn analysis_loop_processes_events_from_channel() {
 
     assert!(detector.is_flagged("evil.com"));
 }
+
+#[test]
+fn test_whitelisted_apex_skips_statistics_for_all_service_names() {
+    for (apex, endpoint) in [
+        ("amazonaws.com", "ce.us-east-1.amazonaws.com"),
+        ("api.aws", "ce.us-east-1.api.aws"),
+        ("example.co.uk", "service.example.co.uk"),
+    ] {
+        let config = TunnelingDetectionConfig {
+            domain_whitelist: vec![apex.to_uppercase()],
+            ..test_config()
+        };
+        let (detector, _tx, _rx) = TunnelingDetector::new(&config);
+        for i in 0..85 {
+            let domain = format!("abcdefghijklmnopqrstuv{i}.eu-central-1.{apex}");
+            detector.process_event(&make_event(&domain, RecordType::A, false));
+        }
+        assert_eq!(detector.tracked_count(), 0, "{apex}");
+        assert_eq!(detector.flagged_count(), 0, "{apex}");
+        detector
+            .flagged_domains
+            .insert(Arc::from(apex), coarse_now_ns());
+        assert!(!detector.is_flagged(endpoint));
+        assert!(!detector.is_flagged(&endpoint.to_uppercase()));
+    }
+}
+
+#[test]
+fn test_whitelisted_endpoint_ignores_parent_flag_without_exempting_siblings() {
+    let endpoint = "ce.us-east-1.amazonaws.com";
+    let config = TunnelingDetectionConfig {
+        domain_whitelist: vec![endpoint.to_uppercase()],
+        ..test_config()
+    };
+    let (detector, _tx, _rx) = TunnelingDetector::new(&config);
+    detector.process_event(&make_event(endpoint, RecordType::A, false));
+    assert_eq!(detector.tracked_count(), 0);
+    detector
+        .flagged_domains
+        .insert(Arc::from("amazonaws.com"), coarse_now_ns());
+    assert!(!detector.is_flagged(endpoint));
+    assert!(!detector.is_flagged(&endpoint.to_uppercase()));
+    assert!(detector.is_flagged("ec2.eu-central-1.amazonaws.com"));
+    assert!(detector.is_flagged("nested.ce.us-east-1.amazonaws.com"));
+    assert!(detector.is_flagged("amazonaws.com"));
+}
+
+#[test]
+fn test_apex_whitelist_preserves_detection_for_unrelated_namespaces() {
+    let config = TunnelingDetectionConfig {
+        domain_whitelist: vec!["amazonaws.com".into(), "api.aws".into()],
+        ..test_config()
+    };
+    let (detector, _tx, _rx) = TunnelingDetector::new(&config);
+    for apex in [
+        "notamazonaws.com",
+        "amazonaws.com.example.net",
+        "api.aws.example.org",
+    ] {
+        for i in 0..20 {
+            let domain = format!("a3f8d2e1b7c4{i}.{apex}");
+            detector.process_event(&make_event(&domain, RecordType::TXT, true));
+        }
+        assert!(detector.is_flagged(apex), "{apex}");
+    }
+}

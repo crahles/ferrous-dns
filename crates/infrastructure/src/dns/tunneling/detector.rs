@@ -70,6 +70,9 @@ impl TunnelingDetector {
     #[doc(hidden)]
     pub fn process_event(&self, event: &TunnelingAnalysisEvent) {
         let apex = extract_apex(&event.domain);
+        if self.is_domain_whitelisted(&event.domain, apex) {
+            return;
+        }
         let key = TrackingKey {
             subnet: subnet_key_from_ip(event.client_ip),
             apex_hash: fx_hash_str(apex),
@@ -129,6 +132,12 @@ impl TunnelingDetector {
                 }
             }
         }
+    }
+
+    fn is_domain_whitelisted(&self, domain: &str, apex: &str) -> bool {
+        self.config.domain_whitelist.iter().any(|allowed| {
+            domain.eq_ignore_ascii_case(allowed) || apex.eq_ignore_ascii_case(allowed)
+        })
     }
 
     fn compute_confidence(&self, stats: &ClientApexStats, domain: &str) -> SignalScore {
@@ -235,6 +244,7 @@ impl TunnelingEvictionTarget for TunnelingDetector {
 
 impl TunnelingFlagStore for TunnelingDetector {
     fn is_flagged(&self, domain: &str) -> bool {
-        self.flagged_domains.contains_key(extract_apex(domain))
+        let apex = extract_apex(domain);
+        !self.is_domain_whitelisted(domain, apex) && self.flagged_domains.contains_key(apex)
     }
 }

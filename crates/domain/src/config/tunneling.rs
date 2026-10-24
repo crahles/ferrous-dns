@@ -45,7 +45,9 @@ pub struct TunnelingDetectionConfig {
     /// Seconds before idle tracking entries are evicted from memory.
     pub stale_entry_ttl_secs: u64,
 
-    /// Domains exempt from tunneling detection (e.g. CDN domains with long labels).
+    /// Case-insensitive exact names exempt from tunneling detection.
+    /// Apex entries also exempt their namespace from phase-2 statistical analysis;
+    /// phase-1 length and NULL-query checks still apply to their subdomains.
     pub domain_whitelist: Vec<String>,
 
     /// Client CIDRs exempt from tunneling detection.
